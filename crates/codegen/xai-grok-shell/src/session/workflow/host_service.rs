@@ -145,6 +145,9 @@ fn reply_cancelled(req: WorkflowHostRequest) {
         R::SpawnAgent { reply, .. } => {
             let _ = reply.send(Err(HostError::Cancelled));
         }
+        R::ResolveWorkflow { reply, .. } => {
+            let _ = reply.send(Err(HostError::Cancelled));
+        }
         R::BudgetQuery { reply } => {
             let _ = reply.send(Err(HostError::Cancelled));
         }
@@ -265,6 +268,12 @@ impl HostService {
                     let result = svc.spawn_agent(opts).await;
                     let _ = reply.send(result);
                 });
+            }
+            WorkflowHostRequest::ResolveWorkflow { name, reply } => {
+                let result = super::registry::resolve_by_name(&name, Some(&self.params.cwd))
+                    .map(|resolved| resolved.script)
+                    .map_err(|error| HostError::Failed(error.to_string()));
+                let _ = reply.send(result);
             }
             WorkflowHostRequest::Phase { title, replayed } => {
                 if title.len() > WORKFLOW_MAX_PHASE_BYTES {

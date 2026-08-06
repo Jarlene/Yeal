@@ -1,14 +1,14 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use rhai::{Dynamic, EvalAltResult, Position};
+use rhai::{Dynamic, EvalAltResult, FnPtr, NativeCallContext, Position};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::host::{AgentOpts, HostError, WorkflowHostRequest};
 use crate::journal::{HOST_ERROR_KEY, Journal, JournalError, request_hash};
 use crate::run::{PauseKind, WorkflowOutcome};
-use crate::{MAX_HOST_CALLS, MAX_PARALLEL};
+use crate::{MAX_HOST_CALLS, MAX_PARALLEL, MAX_WORKFLOW_DEPTH};
 
 pub struct WorkflowRunParams {
     pub script: String,
@@ -36,6 +36,7 @@ struct Ctx {
     host_tx: mpsc::UnboundedSender<WorkflowHostRequest>,
     journal: Journal,
     seq: u64,
+    workflow_stack: Vec<String>,
 }
 
 impl Ctx {
@@ -66,6 +67,34 @@ impl Ctx {
         let start = self.seq;
         self.seq = end;
         Ok(start..end)
+    }
+
+    fn enter_workflow(&mut self, name: &str) -> ScriptResult<()> {
+        if self.workflow_stack.iter().any(|entry| entry == name) {
+            return Err(runtime_error(format!(
+                "workflow recursion detected: {} -> {name}",
+                self.workflow_stack.join(" -> ")
+            )));
+        }
+        if self.workflow_stack.len() >= MAX_WORKFLOW_DEPTH {
+            return Err(runtime_error(format!(
+                "workflow nesting depth exceeded (maximum {MAX_WORKFLOW_DEPTH})"
+            )));
+        }
+        self.workflow_stack.push(name.to_string());
+        Ok(())
+    }
+
+    fn leave_workflow(&mut self) {
+        self.workflow_stack.pop();
+    }
+
+    fn scoped_phase(&self, title: &str) -> String {
+        if self.workflow_stack.is_empty() {
+            title.to_string()
+        } else {
+            format!("{} / {title}", self.workflow_stack.join(" / "))
+        }
     }
 
     fn record(
@@ -114,6 +143,7 @@ pub fn run_workflow(params: WorkflowRunParams) -> WorkflowOutcome {
         host_tx,
         journal,
         seq: 0,
+        workflow_stack: Vec::new(),
     }));
 
     let mut engine = rhai::Engine::new();
@@ -235,6 +265,64 @@ fn dynamic_to_value(d: Dynamic) -> serde_json::Value {
 
 fn value_to_dynamic(v: &serde_json::Value) -> ScriptResult<Dynamic> {
     rhai::serde::to_dynamic(v).map_err(|e| runtime_error(format!("host result conversion: {e}")))
+}
+
+fn inline_workflow_call(
+    context: &NativeCallContext,
+    ctx: &Rc<RefCell<Ctx>>,
+    name: &str,
+    args: Dynamic,
+) -> ScriptResult<Dynamic> {
+    let name = name.to_string();
+    ctx.borrow_mut().enter_workflow(&name)?;
+
+    let result = (|| {
+        let args_value = if args.is_unit() {
+            serde_json::Value::Null
+        } else {
+            rhai::serde::from_dynamic::<serde_json::Value>(&args)
+                .map_err(|e| runtime_error(format!("invalid workflow args: {e}")))?
+        };
+        let payload = serde_json::json!({
+            "name": name.clone(),
+            "args": args_value,
+        });
+        let script_value = host_call(
+            ctx,
+            "resolve_workflow",
+            payload,
+            |reply| WorkflowHostRequest::ResolveWorkflow {
+                name: name.clone(),
+                reply,
+            },
+            serde_json::Value::String,
+        )?;
+        let script = script_value
+            .as_str()
+            .ok_or_else(|| runtime_error("workflow resolver returned a non-string script"))?;
+        let ast = context
+            .engine()
+            .compile(script)
+            .map_err(|e| runtime_error(format!("workflow '{name}' failed to compile: {e}")))?;
+        let args_dyn = value_to_dynamic(&args_value)?;
+        let mut scope = rhai::Scope::new();
+        scope.push_dynamic("args", args_dyn);
+
+        match context
+            .engine()
+            .eval_ast_with_scope::<Dynamic>(&mut scope, &ast)
+        {
+            Ok(value) => Ok(value),
+            Err(error) => match find_control_token(&error) {
+                Some(ControlToken::Complete(value)) => value_to_dynamic(&value),
+                Some(token) => Err(terminated(token)),
+                None => Err(error),
+            },
+        }
+    })();
+
+    ctx.borrow_mut().leave_workflow();
+    result
 }
 
 fn map_to_value(map: rhai::Map) -> ScriptResult<serde_json::Value> {
@@ -487,6 +575,49 @@ fn agent_opts_from_map(prompt: Option<&str>, map: rhai::Map) -> ScriptResult<Age
     Ok(opts)
 }
 
+fn pipeline_impl(
+    context: &NativeCallContext,
+    items: rhai::Array,
+    stages: &[FnPtr],
+) -> ScriptResult<rhai::Array> {
+    if items.len() > MAX_PARALLEL {
+        return Err(runtime_error(format!(
+            "pipeline() accepts at most {MAX_PARALLEL} items per call (got {})",
+            items.len()
+        )));
+    }
+
+    let mut results = rhai::Array::with_capacity(items.len());
+    for (index, item) in items.into_iter().enumerate() {
+        let index = rhai::INT::try_from(index)
+            .map_err(|_| runtime_error("pipeline() item index overflowed"))?;
+        let original = item.clone();
+        let mut previous = item;
+        for stage in stages {
+            previous = stage
+                .call_within_context::<Dynamic>(context, (previous, original.clone(), index))?;
+        }
+        results.push(previous);
+    }
+    Ok(results)
+}
+
+fn pipeline_from_stage_array(
+    context: &NativeCallContext,
+    items: rhai::Array,
+    stage_values: rhai::Array,
+) -> ScriptResult<rhai::Array> {
+    let stages = stage_values
+        .into_iter()
+        .map(|stage| {
+            stage
+                .try_cast::<FnPtr>()
+                .ok_or_else(|| runtime_error("pipeline() stages must be function closures"))
+        })
+        .collect::<ScriptResult<Vec<_>>>()?;
+    pipeline_impl(context, items, &stages)
+}
+
 fn register_host_fns(engine: &mut rhai::Engine, ctx: &Rc<RefCell<Ctx>>) {
     let c = ctx.clone();
     engine.register_fn("agent", move |prompt: &str| -> ScriptResult<Dynamic> {
@@ -687,8 +818,55 @@ fn register_host_fns(engine: &mut rhai::Engine, ctx: &Rc<RefCell<Ctx>>) {
     );
 
     let c = ctx.clone();
+    engine.register_fn(
+        "workflow",
+        move |context: NativeCallContext, name: &str, args: Dynamic| -> ScriptResult<Dynamic> {
+            inline_workflow_call(&context, &c, name, args)
+        },
+    );
+    let c = ctx.clone();
+    engine.register_fn(
+        "workflow",
+        move |context: NativeCallContext, name: &str| -> ScriptResult<Dynamic> {
+            inline_workflow_call(&context, &c, name, Dynamic::UNIT)
+        },
+    );
+
+    macro_rules! register_pipeline {
+        ($($stage:ident),+) => {
+            engine.register_fn(
+                "pipeline",
+                move |context: NativeCallContext, items: rhai::Array, $($stage: FnPtr),+|
+                    -> ScriptResult<rhai::Array> {
+                    let stages = [$($stage),+];
+                    pipeline_impl(&context, items, &stages)
+                },
+            );
+        };
+    }
+    register_pipeline!(stage1);
+    register_pipeline!(stage1, stage2);
+    register_pipeline!(stage1, stage2, stage3);
+    register_pipeline!(stage1, stage2, stage3, stage4);
+    register_pipeline!(stage1, stage2, stage3, stage4, stage5);
+    register_pipeline!(stage1, stage2, stage3, stage4, stage5, stage6);
+    register_pipeline!(stage1, stage2, stage3, stage4, stage5, stage6, stage7);
+    register_pipeline!(
+        stage1, stage2, stage3, stage4, stage5, stage6, stage7, stage8
+    );
+    engine.register_fn(
+        "pipeline",
+        move |context: NativeCallContext,
+              items: rhai::Array,
+              stage_values: rhai::Array|
+              -> ScriptResult<rhai::Array> {
+            pipeline_from_stage_array(&context, items, stage_values)
+        },
+    );
+
+    let c = ctx.clone();
     engine.register_fn("phase", move |title: &str| {
-        let title = title.to_string();
+        let title = c.borrow().scoped_phase(title);
         host_emit(&c, |replayed| WorkflowHostRequest::Phase {
             title,
             replayed,
@@ -972,6 +1150,230 @@ mod tests {
         match outcome {
             WorkflowOutcome::Completed { result } => {
                 assert_eq!(result, serde_json::json!("agent says hi"));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inline_workflow_returns_child_result_and_scopes_phases() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let host = spawn_mock_host(rx, |req| match req {
+            WorkflowHostRequest::ResolveWorkflow { name, reply } => {
+                assert_eq!(name, "increment");
+                let _ = reply.send(Ok(r#"
+                    let meta = #{ name: "increment", description: "increment a value" };
+                    phase("Child");
+                    complete(args.value + 1);
+                    "#
+                .into()));
+            }
+            WorkflowHostRequest::Phase { title, replayed } => {
+                assert_eq!(title, "increment / Child");
+                assert!(!replayed);
+            }
+            other => panic!("unexpected request: {other:?}"),
+        });
+
+        let outcome = run_workflow(params(
+            r#"
+            let meta = #{ name: "t", description: "d" };
+            let result = workflow("increment", #{ value: 4 });
+            complete(result * 2);
+            "#,
+            Journal::new(None),
+            tx,
+        ));
+        drop(host);
+
+        match outcome {
+            WorkflowOutcome::Completed { result } => {
+                assert_eq!(result, serde_json::json!(10));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inline_workflow_replays_resolved_script_without_host_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("journal.jsonl");
+        let script = r#"
+            let meta = #{ name: "t", description: "d" };
+            complete(workflow("increment", #{ value: 4 }));
+        "#;
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let host = spawn_mock_host(rx, |req| match req {
+            WorkflowHostRequest::ResolveWorkflow { reply, .. } => {
+                let _ = reply.send(Ok(
+                    r#"let meta = #{ name: "increment", description: "d" }; complete(args.value + 1);"#
+                        .into(),
+                ));
+            }
+            other => panic!("unexpected request: {other:?}"),
+        });
+        let first = run_workflow(params(script, Journal::new(Some(journal_path.clone())), tx));
+        drop(host);
+        assert!(matches!(first, WorkflowOutcome::Completed { .. }));
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let host = spawn_mock_host(rx, |req| {
+            panic!("replayed inline workflow must not hit host: {req:?}");
+        });
+        let replay = run_workflow(params(script, Journal::load(journal_path).unwrap(), tx));
+        drop(host);
+        match replay {
+            WorkflowOutcome::Completed { result } => {
+                assert_eq!(result, serde_json::json!(5));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inline_workflow_failure_is_catchable() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let host = spawn_mock_host(rx, |req| match req {
+            WorkflowHostRequest::ResolveWorkflow { reply, .. } => {
+                let _ = reply.send(Err(HostError::Failed("unknown workflow".into())));
+            }
+            other => panic!("unexpected request: {other:?}"),
+        });
+        let outcome = run_workflow(params(
+            r#"
+            let meta = #{ name: "t", description: "d" };
+            let result = "not-set";
+            try { result = workflow("missing"); } catch (error) { result = "fallback"; }
+            complete(result);
+            "#,
+            Journal::new(None),
+            tx,
+        ));
+        drop(host);
+
+        match outcome {
+            WorkflowOutcome::Completed { result } => {
+                assert_eq!(result, serde_json::json!("fallback"));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inline_workflow_pause_propagates_to_parent() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let host = spawn_mock_host(rx, |req| match req {
+            WorkflowHostRequest::ResolveWorkflow { reply, .. } => {
+                let _ = reply.send(Ok(
+                    r#"let meta = #{ name: "pauser", description: "pause" }; pause("verification", "child input");"#
+                        .into(),
+                ));
+            }
+            other => panic!("unexpected request: {other:?}"),
+        });
+        let outcome = run_workflow(params(
+            r#"
+            let meta = #{ name: "t", description: "d" };
+            workflow("pauser");
+            complete("unreachable");
+            "#,
+            Journal::new(None),
+            tx,
+        ));
+        drop(host);
+        assert!(matches!(
+            outcome,
+            WorkflowOutcome::Paused {
+                kind: PauseKind::Verification,
+                message
+            } if message == "child input"
+        ));
+    }
+
+    #[test]
+    fn inline_workflow_rejects_recursive_calls() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let host = spawn_mock_host(rx, |req| match req {
+            WorkflowHostRequest::ResolveWorkflow { reply, .. } => {
+                let _ = reply.send(Ok(
+                    r#"let meta = #{ name: "loop", description: "loop" }; complete(workflow("loop"));"#
+                        .into(),
+                ));
+            }
+            other => panic!("unexpected request: {other:?}"),
+        });
+        let outcome = run_workflow(params(
+            r#"
+            let meta = #{ name: "t", description: "d" };
+            workflow("loop");
+            "#,
+            Journal::new(None),
+            tx,
+        ));
+        drop(host);
+        match outcome {
+            WorkflowOutcome::Failed { error } => {
+                assert!(
+                    error.contains("workflow recursion detected"),
+                    "got: {error}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pipeline_runs_ordered_stages_with_item_and_index() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let outcome = run_workflow(params(
+            r#"
+            let meta = #{ name: "t", description: "d" };
+            let results = pipeline(
+                [1, 2, 3],
+                |previous, item, index| previous + item + index,
+                |previous, item, index| previous * 10 + item + index
+            );
+            complete(results);
+            "#,
+            Journal::new(None),
+            tx,
+        ));
+
+        match outcome {
+            WorkflowOutcome::Completed { result } => {
+                assert_eq!(result, serde_json::json!([21, 53, 85]));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pipeline_stage_array_supports_more_than_eight_stages() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let outcome = run_workflow(params(
+            r#"
+            let meta = #{ name: "t", description: "d" };
+            let stages = [
+                |previous, item, index| previous + 1,
+                |previous, item, index| previous + 1,
+                |previous, item, index| previous + 1,
+                |previous, item, index| previous + 1,
+                |previous, item, index| previous + 1,
+                |previous, item, index| previous + 1,
+                |previous, item, index| previous + 1,
+                |previous, item, index| previous + 1,
+                |previous, item, index| previous + 1
+            ];
+            complete(pipeline([1], stages));
+            "#,
+            Journal::new(None),
+            tx,
+        ));
+
+        match outcome {
+            WorkflowOutcome::Completed { result } => {
+                assert_eq!(result, serde_json::json!([10]));
             }
             other => panic!("expected Completed, got {other:?}"),
         }
