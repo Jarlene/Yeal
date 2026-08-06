@@ -73,6 +73,10 @@ pub enum WorkflowHostRequest {
         opts: AgentOpts,
         reply: oneshot::Sender<Result<AgentResult, HostError>>,
     },
+    ResolveWorkflow {
+        name: String,
+        reply: oneshot::Sender<Result<String, HostError>>,
+    },
     Phase {
         title: String,
         replayed: bool,
@@ -115,6 +119,7 @@ impl WorkflowHostRequest {
             Self::ReserveAgentCalls { .. } => "reserve_agent_calls",
             Self::ReleaseAgentCalls { .. } => "release_agent_calls",
             Self::SpawnAgent { .. } => "spawn_agent",
+            Self::ResolveWorkflow { .. } => "resolve_workflow",
             Self::Phase { .. } => "phase",
             Self::Log { .. } => "log",
             Self::Telemetry { .. } => "telemetry",

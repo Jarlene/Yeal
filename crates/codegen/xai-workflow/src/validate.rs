@@ -89,6 +89,13 @@ pub fn validate_script_with_agent_budget(
                         duration_ms: 1,
                     }));
                 }
+                R::ResolveWorkflow { reply, .. } => {
+                    let _ = reply.send(Ok(
+                        r#"let meta = #{ name: "nested-stub", description: "nested stub" };
+                           complete(args);"#
+                            .into(),
+                    ));
+                }
                 R::BudgetQuery { reply } => {
                     let _ = reply.send(Ok(BudgetState {
                         total: None,
@@ -168,6 +175,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(report.name, "t");
+        assert!(report.outcome_ok);
+    }
+
+    #[test]
+    fn inline_workflow_is_available_to_validation_host() {
+        let report = validate_script(
+            r#"
+            let meta = #{ name: "t", description: "d" };
+            complete(workflow("nested", #{ value: 1 }));
+            "#,
+            None,
+        )
+        .unwrap();
         assert!(report.outcome_ok);
     }
 

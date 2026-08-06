@@ -12,6 +12,7 @@ pub const MAX_WORKFLOW_PHASES: usize = 64;
 pub const MAX_PHASE_TITLE_LEN: usize = 128;
 pub const MAX_PHASE_DETAIL_LEN: usize = 1_024;
 pub const MAX_PARALLEL: usize = 1_024;
+pub const MAX_WORKFLOW_DEPTH: usize = 8;
 pub const DEFAULT_AGENT_BUDGET: u64 = 128;
 pub const MAX_AGENT_BUDGET: u64 = 1_024;
 pub const MAX_HOST_CALLS: u64 = 10_000;
