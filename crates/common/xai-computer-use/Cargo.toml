@@ -1,0 +1,62 @@
+[package]
+name = "xai-computer-use"
+version = "0.1.0"
+edition.workspace = true
+license = "Apache-2.0"
+description = "State-scoped desktop and browser computer-use tools for the xAI Computer Hub"
+
+[dependencies]
+async-trait = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+image = { workspace = true, features = ["png", "jpeg"] }
+reqwest = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true, features = ["v7", "serde"] }
+xai-computer-hub-sdk = { workspace = true }
+xai-grok-tools = { workspace = true }
+xai-tool-protocol = { workspace = true }
+xai-tool-runtime = { workspace = true }
+xai-tool-types = { workspace = true }
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+xcap = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true }
+objc2-application-services = { workspace = true }
+objc2-foundation = { workspace = true }
+objc2-core-foundation = { workspace = true }
+objc2-core-graphics = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_UI_Accessibility",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_HiDpi",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+atspi = { workspace = true }
+x11rb = { workspace = true }
+
+[dev-dependencies]
+futures = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

@@ -10,7 +10,7 @@ use crate::{
     types::{
         ToolInput,
         definition::ToolDefinition,
-        output::{ToolOutput, ToolRunResult},
+        output::{DynamicOutput, ToolOutput, ToolRunResult},
         params_validation::{ParamValidationError, validate_params_json},
         requirements::{EvalContext, Expr, ProposedTool, ToolRequirement},
         resources::{InnerDispatch, Resources, SharedResources},
@@ -632,6 +632,52 @@ impl ToolRegistryBuilder {
                 }),
                 register_in_local: Box::new(|lr: &xai_computer_hub_sdk::LocalRegistry| {
                     lr.register(T::default());
+                }),
+            },
+        );
+    }
+    /// Register a type-erased tool (e.g. from an out-of-tree tool pack) into
+    /// the builder.
+    ///
+    /// The tool participates in [`finalize`](Self::finalize) exactly like a
+    /// typed built-in: it is enabled only when its fully-qualified id appears
+    /// in a tool config, and in-process dispatch routes through the finalized
+    /// toolset's `LocalRegistry` under the tool's `Tool::id()`.
+    ///
+    /// `fqid` is the fully-qualified registry key (e.g.
+    /// `"computer_use:find_roots"`) that tool configs use to enable the tool;
+    /// it also becomes the default client-facing name (configs may override it
+    /// via `name_override`). `kind` drives capability filtering and template
+    /// rendering.
+    pub fn register_dyn_tool(
+        &mut self,
+        fqid: &str,
+        tool: Arc<dyn xai_tool_runtime::ToolDyn>,
+        kind: ToolKind,
+    ) {
+        let description = tool.description(&xai_tool_runtime::ListToolsContext::default());
+        let (namespace, _) = fqid.rsplit_once(':').unwrap_or((fqid, ""));
+        let input_schema = description.arguments_schema.unwrap_or_default();
+        self.tools.insert(
+            fqid.to_string(),
+            ToolEntry {
+                namespace: namespace.to_string(),
+                id: tool.id().as_str().to_string(),
+                kind,
+                requires: Expr::True,
+                default_params: serde_json::Value::Object(Default::default()),
+                input_schema,
+                metadata: Box::new(DefaultToolMetadata {
+                    kind,
+                    description: description.description,
+                }),
+                output_converter: Box::new(|value| Ok(ToolOutput::Dynamic(DynamicOutput { value }))),
+                validate_params: Box::new(|_| Ok(())),
+                apply_params: Box::new(|_, _| {}),
+                register_params: Box::new(|_| {}),
+                parse_input: Box::new(|json| Ok(ToolInput::Dynamic(json))),
+                register_in_local: Box::new(move |lr: &xai_computer_hub_sdk::LocalRegistry| {
+                    lr.register_dyn(Arc::clone(&tool));
                 }),
             },
         );

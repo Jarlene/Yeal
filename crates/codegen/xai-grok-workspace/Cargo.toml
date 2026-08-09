@@ -78,6 +78,7 @@ xai-hunk-tracker = { path = "../xai-hunk-tracker" }
 # registry gather → OTLP → hub donation pump); see metric_donation_reporter.
 xai-computer-hub-sdk = { workspace = true, features = ["metrics"] }
 xai-computer-hub-mcp-adapter = { path = "../../common/xai-computer-hub-mcp-adapter" }
+xai-computer-use = { workspace = true }
 xai-grok-mcp = { path = "../xai-grok-mcp" }
 xai-file-utils = { path = "../xai-file-utils" }
 xai-grok-auth = { path = "../xai-grok-auth" }
