@@ -65,19 +65,20 @@ fn tool_count_matches_the_computer_use_family() {
 #[test]
 fn tool_names_are_mcp_compliant_and_mapped_from_tool_ids() {
     let srv = server();
-    // Names use the `computer_use__name` convention (MCP forbids `:`).
+    // Names use the `computer_use_name` convention (MCP forbids `:`;
+    // a single `_` keeps the qualified `server__tool` name unambiguous).
     for name in [
-        "computer_use__find_roots",
-        "computer_use__observe_ui",
-        "computer_use__search_ui",
-        "computer_use__expand_ui",
-        "computer_use__inspect_ui",
-        "computer_use__act_ui",
-        "computer_use__read_text",
-        "computer_use__wait_for",
-        "computer_use__launch_browser",
-        "computer_use__navigate_browser",
-        "computer_use__evaluate_browser",
+        "computer_use_find_roots",
+        "computer_use_observe_ui",
+        "computer_use_search_ui",
+        "computer_use_expand_ui",
+        "computer_use_inspect_ui",
+        "computer_use_act_ui",
+        "computer_use_read_text",
+        "computer_use_wait_for",
+        "computer_use_launch_browser",
+        "computer_use_navigate_browser",
+        "computer_use_evaluate_browser",
     ] {
         let tool = srv.get_tool(name).expect("tool should be discoverable");
         assert!(is_mcp_tool_name(tool.name.as_ref()), "bad name: {tool:?}");
@@ -116,13 +117,13 @@ async fn full_mcp_session_over_in_memory_transport() {
         .expect("tools/list should succeed");
     assert_eq!(tools.len(), 11, "all computer-use tools are advertised");
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
-    assert!(names.contains(&"computer_use__find_roots"));
-    assert!(names.contains(&"computer_use__act_ui"));
+    assert!(names.contains(&"computer_use_find_roots"));
+    assert!(names.contains(&"computer_use_act_ui"));
     assert!(tools.iter().all(|t| is_mcp_tool_name(t.name.as_ref())));
 
     // tools/call: find_roots
     let result = client
-        .call_tool(CallToolRequestParams::new("computer_use__find_roots"))
+        .call_tool(CallToolRequestParams::new("computer_use_find_roots"))
         .await
         .expect("find_roots call should succeed");
     assert_ne!(result.is_error, Some(true), "find_roots must not error");
@@ -137,7 +138,7 @@ async fn full_mcp_session_over_in_memory_transport() {
         serde_json::from_value(json!({ "root": "@r1" })).unwrap();
     let result = client
         .call_tool(
-            CallToolRequestParams::new("computer_use__observe_ui").with_arguments(args),
+            CallToolRequestParams::new("computer_use_observe_ui").with_arguments(args),
         )
         .await
         .expect("observe_ui call should succeed");
@@ -150,7 +151,7 @@ async fn full_mcp_session_over_in_memory_transport() {
 
     // tools/call: unknown tool → protocol error on the wire
     let unknown = client
-        .call_tool(CallToolRequestParams::new("computer_use__no_such_tool"))
+        .call_tool(CallToolRequestParams::new("computer_use_no_such_tool"))
         .await;
     assert!(unknown.is_err(), "unknown tool must be a protocol error");
 
