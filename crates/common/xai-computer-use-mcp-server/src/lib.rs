@@ -11,9 +11,10 @@
 //!
 //! Tools are discovered from [`xai_computer_use::tools::computer_use_tools`]
 //! at construction and exposed under MCP-compliant names:
-//! `computer_use:find_roots` → `computer_use__find_roots` (the `:` separator
+//! `computer_use:find_roots` → `computer_use_find_roots` (the `:` separator
 //! of the in-process [`ToolId`] is not valid in an MCP tool name, so it maps
-//! to `__`, matching the workspace's `server__tool` convention).
+//! to `_`. Keeping `__` out of the exposed name preserves the workspace's
+//! unambiguous `server__tool` qualified-name convention for MCP clients).
 //!
 //! # Usage
 //!
@@ -89,9 +90,15 @@ impl ComputerUseMcpServer {
 }
 
 /// Map an in-process [`ToolId`] (`computer_use:find_roots`) to the
-/// MCP-compliant tool name (`computer_use__find_roots`).
+/// MCP-compliant tool name (`computer_use_find_roots`).
+///
+/// `:` is replaced with a single `_` rather than `__`: an MCP tool name
+/// containing `__` collides with the `server__tool` qualified-name boundary
+/// used by MCP clients, so e.g. `computer-use__computer_use__find_roots`
+/// parses as ambiguous and every tool in the family gets rejected at
+/// discovery.
 fn mcp_tool_name(id: &ToolId) -> String {
-    id.as_str().replace(':', "__")
+    id.as_str().replace(':', "_")
 }
 
 /// Convert one [`ArcTool`] into an rmcp `Tool` definition for `tools/list`.
