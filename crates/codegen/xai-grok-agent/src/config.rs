@@ -264,29 +264,54 @@ pub fn toolset_for_preset(preset: &str) -> Option<ToolServerConfig> {
         .or_else(|| registered_toolset_preset(&normalized))
 }
 fn default_grok_build_toolset() -> ToolServerConfig {
+    let mut tools = vec![
+        bash_tool_config(),
+        (&grok_build::ReadFileTool).into(),
+        (&grok_build::SearchReplaceTool).into(),
+        (&grok_build::ListDirTool).into(),
+        (&grok_build::GrepTool).into(),
+        kill_task_tool_config(),
+        (&grok_build::TodoWriteTool).into(),
+        task_output_tool_config(),
+        wait_tasks_tool_config(),
+        task_tool_config(),
+        (&grok_build::SchedulerCreateTool).into(),
+        (&grok_build::SchedulerDeleteTool).into(),
+        (&grok_build::SchedulerListTool).into(),
+        (&grok_build::MonitorTool).into(),
+        (&search_tool::SearchTool).into(),
+        (&use_tool::UseTool).into(),
+        (&grok_build::UpdateGoalTool).into(),
+        (&grok_build::WorkflowTool).into(),
+    ];
+    // Desktop/browser computer-use tools (xai-computer-use). Enabled for
+    // every grok-build session; the tools resolve to the shared
+    // ComputerUseService via the tool pack registered at agent build time.
+    tools.extend(computer_use_tool_configs());
     ToolServerConfig {
-        tools: vec![
-            bash_tool_config(),
-            (&grok_build::ReadFileTool).into(),
-            (&grok_build::SearchReplaceTool).into(),
-            (&grok_build::ListDirTool).into(),
-            (&grok_build::GrepTool).into(),
-            kill_task_tool_config(),
-            (&grok_build::TodoWriteTool).into(),
-            task_output_tool_config(),
-            wait_tasks_tool_config(),
-            task_tool_config(),
-            (&grok_build::SchedulerCreateTool).into(),
-            (&grok_build::SchedulerDeleteTool).into(),
-            (&grok_build::SchedulerListTool).into(),
-            (&grok_build::MonitorTool).into(),
-            (&search_tool::SearchTool).into(),
-            (&use_tool::UseTool).into(),
-            (&grok_build::UpdateGoalTool).into(),
-            (&grok_build::WorkflowTool).into(),
-        ],
+        tools,
         behavior_preset: None,
     }
+}
+/// `ToolConfig` entries for the computer-use tool family. Ids must match the
+/// ids registered by `xai_computer_use::register_computer_use_tool_pack`.
+fn computer_use_tool_configs() -> Vec<ToolConfig> {
+    [
+        "find_roots",
+        "observe_ui",
+        "search_ui",
+        "expand_ui",
+        "inspect_ui",
+        "act_ui",
+        "read_text",
+        "wait_for",
+        "launch_browser",
+        "navigate_browser",
+        "evaluate_browser",
+    ]
+    .into_iter()
+    .map(|name| ToolConfig::from_id(format!("computer_use:{name}")))
+    .collect()
 }
 fn grok_build_concise_toolset() -> ToolServerConfig {
     ToolServerConfig {

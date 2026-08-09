@@ -568,6 +568,17 @@ impl WorkspaceHandle {
     ) -> WorkspaceResult<Self> {
         let sessions = std::collections::HashMap::new();
         let local_registry = xai_computer_hub_sdk::LocalRegistry::new();
+        // Register the pi-computer-use-compatible desktop/browser control tools
+        // (observe/act/read_text/wait_for + browser launch/navigate/evaluate) into
+        // every session's toolset. Backend selection follows the platform and env
+        // (COMPUTER_USE_CDP_PORT / COMPUTER_USE_BROWSER_PATH /
+        // COMPUTER_USE_HEADLESS). The service keeps its own per-session state
+        // keyed by session, so a single shared instance is safe. The model-facing
+        // registration happens through the tool pack registered at agent build
+        // time (xai-grok-agent); this registry entry keeps the workspace-local
+        // harness path able to resolve the same shared service.
+        let computer_use_service = xai_computer_use::ComputerUseService::shared();
+        xai_computer_use::register_computer_use_tools(&local_registry, computer_use_service);
         let capacity = if config.event_buffer_capacity == 0 {
             DEFAULT_EVENT_BUFFER_CAPACITY
         } else {

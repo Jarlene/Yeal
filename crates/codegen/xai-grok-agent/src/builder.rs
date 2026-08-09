@@ -710,6 +710,11 @@ impl AgentBuilder {
         } else {
             std::collections::HashSet::new()
         };
+        // Out-of-tree tool packs (e.g. computer-use) must register before the
+        // first ToolRegistryBuilder::new() in the process. Every agent build
+        // funnels through here, so this is the single choke point that
+        // guarantees the packs are in place before this builder is created.
+        xai_computer_use::ensure_computer_use_tool_pack_registered();
         let tool_bridge_builder = ToolBridge::get_builder();
         let state_path = self.state_path.clone().unwrap_or_default();
         let mut tool_config = definition.tool_config.clone();
