@@ -1,0 +1,27 @@
+[package]
+name = "xai-computer-use-mcp-server"
+version = "0.1.0"
+edition.workspace = true
+license = "Apache-2.0"
+description = "MCP server exposing the xai-computer-use tool family (desktop and browser UI automation) over stdio"
+
+[dependencies]
+futures = { workspace = true }
+rmcp = { version = "2.1", default-features = false, features = ["server"] }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+xai-computer-use = { path = "../xai-computer-use" }
+xai-tool-protocol = { workspace = true }
+xai-tool-runtime = { workspace = true }
+xai-tool-types = { workspace = true }
+
+[dev-dependencies]
+futures = { workspace = true }
+rmcp = { version = "2.1", default-features = false, features = ["server", "client"] }
+
+[lints]
+workspace = true
