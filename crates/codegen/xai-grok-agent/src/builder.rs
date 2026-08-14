@@ -2293,6 +2293,8 @@ mod tests {
             model: "test-web-search-model".into(),
             extra_headers: Default::default(),
             alpha_test_key: None,
+            allowed_domains: None,
+            excluded_domains: None,
         })
         .with_web_fetch_config(WebFetchConfig::Enabled {
             params: Default::default(),
@@ -2420,6 +2422,8 @@ mod tests {
                 model: "test-web-search-model".into(),
                 extra_headers: Default::default(),
                 alpha_test_key: None,
+                allowed_domains: None,
+                excluded_domains: None,
             }
         } else {
             WebSearchConfig::Disabled
