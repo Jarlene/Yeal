@@ -320,6 +320,7 @@ xai-circuit-breaker = { path = "crates/common/xai-circuit-breaker" }
 xai-compaction-transcript = { path = "crates/codegen/xai-compaction-transcript" }
 xai-computer-hub-core = { path = "crates/common/xai-computer-hub-core" }
 xai-computer-hub-sdk = { path = "crates/common/xai-computer-hub-sdk" }
+xai-computer-use = { path = "crates/common/xai-computer-use" }
 xai-fuzzy-file-search = { path = "crates/codegen/xai-fuzzy-file-search" }
 xai-computer-use = { path = "crates/common/xai-computer-use" }
 xai-gix-status = { path = "crates/codegen/xai-gix-status" }
