@@ -111,6 +111,13 @@ fn validate_script_with_agent_budget_and_cancel(
                         duration_ms: 1,
                     }));
                 }
+                R::ResolveWorkflow { reply, .. } => {
+                    let _ = reply.send(Ok(
+                        r#"let meta = #{ name: "nested-stub", description: "nested stub" };
+                           complete(args);"#
+                            .into(),
+                    ));
+                }
                 R::BudgetQuery { reply } => {
                     let _ = reply.send(Ok(BudgetState {
                         total: None,
