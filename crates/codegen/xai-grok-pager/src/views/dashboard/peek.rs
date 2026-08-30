@@ -791,6 +791,7 @@ pub fn extract_last_response_type(agent: &AgentView) -> String {
                     ToolCallBlock::MemorySearch(_) => Some("Memory"),
                     ToolCallBlock::SentMessage(_) => Some("Message"),
                     ToolCallBlock::Skill(_) => Some("Skill"),
+                    ToolCallBlock::Gui(_) => Some("GUI"),
                     ToolCallBlock::Other(_) => Some("Tool"),
                 };
                 if let Some(label) = label {

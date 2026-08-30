@@ -95,6 +95,7 @@ pub(crate) const ALL_TOOL_KINDS: &[ToolKind] = &[
     ToolKind::Monitor,
     ToolKind::GoalUpdate,
     ToolKind::Workflow,
+    ToolKind::Gui,
     ToolKind::Feedback,
     ToolKind::Other,
 ];
@@ -134,6 +135,10 @@ pub(crate) fn kind_allowed(mode: CapabilityMode, kind: ToolKind) -> bool {
         // Edit class.
         Edit | Write | Delete | Move | Feedback | ImageGen | VideoGen | ImageToVideo
         | ReferenceToVideo | DeployApp | InitOrUpdateApp => matches!(mode, M::ReadWrite),
+
+        // GUI automation: drives the real mouse/keyboard, so it mutates
+        // machine state outside the workspace like the edit class.
+        Gui => matches!(mode, M::ReadWrite),
 
         // Bash / shell.
         Execute => matches!(mode, M::Execute),

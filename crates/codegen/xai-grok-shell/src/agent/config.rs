@@ -3592,6 +3592,9 @@ struct DefaultModelJson {
     auto_compact_threshold_percent: Option<u8>,
     #[serde(default)]
     system_prompt_label: Option<String>,
+    /// Optional image-input capability flag in the embedded catalog.
+    #[serde(default)]
+    image_input: Option<bool>,
 }
 fn default_models(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntryConfig> {
     let root: serde_json::Value = serde_json::from_str(crate::models::DEFAULT_MODELS_JSON)
@@ -3654,6 +3657,7 @@ fn default_models(endpoints: &EndpointsConfig) -> IndexMap<String, ModelEntryCon
                 compaction_at_tokens: m.compaction_at_tokens,
                 show_model_fingerprint: m.show_model_fingerprint,
                 stream_tool_calls: None,
+                image_input: m.image_input,
                 reasoning_summary: None,
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
             };
@@ -4095,6 +4099,12 @@ pub struct ModelInfo {
     pub show_model_fingerprint: bool,
     /// When `Some(true)`, the sampler injects `stream_tool_calls: true`
     pub stream_tool_calls: Option<bool>,
+    /// Whether the model accepts image inputs (upstream GUI grounding gate:
+    /// codex `InputModality::Image`). `None`/omitted = assumed supported;
+    /// `Some(false)` marks keyboard-only models and disables semantic GUI
+    /// grounding plus screenshot attachment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_input: Option<bool>,
     /// Responses API `reasoning.summary` override; `None` keeps the request builder's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_summary: Option<ReasoningSummary>,
@@ -4151,6 +4161,7 @@ impl ModelInfo {
             compaction_at_tokens: None,
             show_model_fingerprint: false,
             stream_tool_calls: None,
+            image_input: None,
             reasoning_summary: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
         }
@@ -4192,9 +4203,16 @@ impl ModelInfo {
             compaction_at_tokens: entry.compaction_at_tokens,
             show_model_fingerprint: entry.show_model_fingerprint,
             stream_tool_calls: entry.stream_tool_calls,
+            image_input: entry.image_input,
             reasoning_summary: entry.reasoning_summary,
             laziness_detector: entry.laziness_detector.clone(),
         }
+    }
+    /// Whether this model accepts image inputs. `image_input: None`
+    /// (unset) is treated as supported so vision stays on by default;
+    /// only an explicit `false` marks a keyboard-only model.
+    pub fn image_input_supported(&self) -> bool {
+        self.image_input.unwrap_or(true)
     }
     /// Whether `id` is one of the ids this model sends: its own, or the one it uses at some effort.
     pub(crate) fn has_model_id(&self, id: &str) -> bool {
@@ -4889,6 +4907,7 @@ pub(crate) fn resolve_aux_model_sampling_config(
                 compaction_at_tokens: None,
                 show_model_fingerprint: false,
                 stream_tool_calls: None,
+                image_input: None,
                 reasoning_summary: None,
                 laziness_detector: LazinessDetectorPerModelConfig::default(),
             },
@@ -5116,6 +5135,7 @@ fn resolve_hidden_default_web_search_sampling_config(
             compaction_at_tokens: None,
             show_model_fingerprint: false,
             stream_tool_calls: None,
+            image_input: None,
             reasoning_summary: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
         },

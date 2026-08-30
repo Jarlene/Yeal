@@ -1,5 +1,6 @@
 mod edit;
 mod execute;
+pub(crate) mod gui;
 pub mod list_dir;
 pub(crate) mod memory_search;
 mod other;
@@ -100,6 +101,9 @@ pub enum VerbGroupKind {
     McpCall,
     /// Sent subagent messages. Label-only, like [`Self::Command`].
     Message,
+    /// Native GUI automation calls (macOS/Linux; `gui_*`). Label-only, like
+    /// [`Self::Command`].
+    Gui,
     /// Unclassified tools. Label-only, like [`Self::Command`].
     OtherTool,
 }
@@ -121,6 +125,7 @@ impl VerbGroupKind {
             VerbGroupKind::Message => ("Sent", "Sending"),
             VerbGroupKind::EditFile => ("Edited", "Editing"),
             VerbGroupKind::McpCall => ("Called", "Calling"),
+            VerbGroupKind::Gui => ("Ran", "Running"),
         };
         if running { present } else { past }
     }
@@ -138,6 +143,7 @@ impl VerbGroupKind {
             VerbGroupKind::Subagent => ("subagent", "subagents"),
             VerbGroupKind::Command => ("command", "commands"),
             VerbGroupKind::Message => ("message", "messages"),
+            VerbGroupKind::Gui => ("GUI action", "GUI actions"),
             VerbGroupKind::OtherTool => ("tool", "tools"),
         };
         if count == 1 { one } else { many }
@@ -164,6 +170,12 @@ pub enum ToolCallBlock {
     SentMessage(SentMessageToolCallBlock),
     /// Skill invocation (user skills / slash commands via the Skill tool).
     Skill(OtherToolCallBlock),
+    /// Native GUI automation (macOS/Linux; `gui_observe`, `gui_click`,
+    /// `gui_drag`, `gui_scroll`, `gui_type`, `gui_key`, `gui_move`,
+    /// `gui_wait`, `gui_batch`) — upstream PR understudy-ai/codex-cua#3.
+    /// Reuses the
+    /// generic renderer with a GUI-specific compact argument summary.
+    Gui(OtherToolCallBlock),
     Other(OtherToolCallBlock),
 }
 
@@ -183,6 +195,7 @@ macro_rules! delegate_tool {
             ToolCallBlock::MemorySearch(b) => b.$method($($arg),*),
             ToolCallBlock::SentMessage(b) => b.$method($($arg),*),
             ToolCallBlock::Skill(b) => b.$method($($arg),*),
+            ToolCallBlock::Gui(b) => b.$method($($arg),*),
             ToolCallBlock::Other(b) => b.$method($($arg),*),
         }
     };
@@ -316,6 +329,9 @@ impl ToolCallBlock {
             (ToolCallBlock::Skill(new), ToolCallBlock::Skill(old)) => {
                 new.started_at = old.started_at;
             }
+            (ToolCallBlock::Gui(new), ToolCallBlock::Gui(old)) => {
+                new.started_at = old.started_at;
+            }
             (ToolCallBlock::Other(new), ToolCallBlock::Other(old)) => {
                 new.started_at = old.started_at;
             }
@@ -332,6 +348,7 @@ impl ToolCallBlock {
                 | ToolCallBlock::MemorySearch(_)
                 | ToolCallBlock::SentMessage(_)
                 | ToolCallBlock::Skill(_)
+                | ToolCallBlock::Gui(_)
                 | ToolCallBlock::Other(_),
                 _,
             ) => {}
@@ -353,6 +370,7 @@ impl ToolCallBlock {
             ToolCallBlock::MemorySearch(b) => b.is_success(),
             ToolCallBlock::SentMessage(b) => b.is_success(),
             ToolCallBlock::Skill(b) => b.is_success(),
+            ToolCallBlock::Gui(b) => b.is_success(),
             ToolCallBlock::Other(b) => b.is_success(),
         }
     }
@@ -374,6 +392,7 @@ impl ToolCallBlock {
             ToolCallBlock::MemorySearch(b) => b.started_at = Some(instant),
             ToolCallBlock::SentMessage(b) => b.started_at = Some(instant),
             ToolCallBlock::Skill(b) => b.started_at = Some(instant),
+            ToolCallBlock::Gui(b) => b.started_at = Some(instant),
             ToolCallBlock::Other(b) => b.started_at = Some(instant),
         }
     }
@@ -442,6 +461,11 @@ impl ToolCallBlock {
                     b.started_at = Some(std::time::Instant::now());
                 }
             }
+            ToolCallBlock::Gui(b) => {
+                if b.started_at.is_none() {
+                    b.started_at = Some(std::time::Instant::now());
+                }
+            }
             ToolCallBlock::Other(b) => {
                 if b.started_at.is_none() {
                     b.started_at = Some(std::time::Instant::now());
@@ -474,6 +498,9 @@ impl ToolCallBlock {
             }
             "use_tool" => ToolCallBlock::UseTool(UseToolCallBlock::new(summary)),
             "skill" => ToolCallBlock::Skill(OtherToolCallBlock::new("Skill", summary)),
+            name if gui::is_gui_tool_name(name) => {
+                ToolCallBlock::Gui(OtherToolCallBlock::new(name, summary))
+            }
             _ => ToolCallBlock::Other(OtherToolCallBlock::new(name, summary)),
         }
     }
@@ -544,12 +571,14 @@ impl ToolCallBlock {
                 join_searchable([Some(b.query.clone()), results, b.error.clone()])
             }
             ToolCallBlock::SentMessage(b) => b.searchable_text(),
-            ToolCallBlock::Skill(b) | ToolCallBlock::Other(b) => join_searchable([
-                Some(b.name.clone()),
-                Some(b.summary.clone()),
-                b.output.clone(),
-                b.error.clone(),
-            ]),
+            ToolCallBlock::Skill(b) | ToolCallBlock::Gui(b) | ToolCallBlock::Other(b) => {
+                join_searchable([
+                    Some(b.name.clone()),
+                    Some(b.summary.clone()),
+                    b.output.clone(),
+                    b.error.clone(),
+                ])
+            }
         }
     }
 
@@ -582,6 +611,7 @@ impl ToolCallBlock {
             | ToolCallBlock::Edit(_)
             | ToolCallBlock::UseTool(_)
             | ToolCallBlock::SentMessage(_)
+            | ToolCallBlock::Gui(_)
             | ToolCallBlock::Other(_) => None,
         }
     }
@@ -595,6 +625,7 @@ impl ToolCallBlock {
             ToolCallBlock::Edit(_) => Some(VerbGroupKind::EditFile),
             ToolCallBlock::UseTool(_) => Some(VerbGroupKind::McpCall),
             ToolCallBlock::SentMessage(_) => Some(VerbGroupKind::Message),
+            ToolCallBlock::Gui(_) => Some(VerbGroupKind::Gui),
             ToolCallBlock::Other(_) => Some(VerbGroupKind::OtherTool),
             ToolCallBlock::Read(_)
             | ToolCallBlock::ListDir(_)
@@ -637,6 +668,8 @@ mod tests {
         assert_eq!(VerbGroupKind::Message.verb(false), "Sent");
         assert_eq!(VerbGroupKind::Message.verb(true), "Sending");
         assert_eq!(VerbGroupKind::OtherTool.verb(false), "Ran");
+        assert_eq!(VerbGroupKind::Gui.verb(false), "Ran");
+        assert_eq!(VerbGroupKind::Gui.verb(true), "Running");
     }
 
     #[test]
@@ -663,6 +696,8 @@ mod tests {
         assert_eq!(VerbGroupKind::Message.noun(2), "messages");
         assert_eq!(VerbGroupKind::OtherTool.noun(1), "tool");
         assert_eq!(VerbGroupKind::OtherTool.noun(2), "tools");
+        assert_eq!(VerbGroupKind::Gui.noun(1), "GUI action");
+        assert_eq!(VerbGroupKind::Gui.noun(3), "GUI actions");
     }
 
     #[test]
@@ -690,6 +725,7 @@ mod tests {
                 }),
             )),
             ToolCallBlock::Skill(OtherToolCallBlock::new("Skill", "deploy")),
+            ToolCallBlock::Gui(OtherToolCallBlock::new("Click", "Send button")),
             ToolCallBlock::Other(OtherToolCallBlock::new("todo_write", "update")),
         ];
         for block in &blocks {
@@ -708,6 +744,7 @@ mod tests {
                 | ToolCallBlock::Edit(_)
                 | ToolCallBlock::UseTool(_)
                 | ToolCallBlock::SentMessage(_)
+                | ToolCallBlock::Gui(_)
                 | ToolCallBlock::Other(_) => None,
             };
             assert_eq!(block.verb_group_kind(), expected, "block: {block:?}");
@@ -739,6 +776,10 @@ mod tests {
         assert_eq!(
             ToolCallBlock::Other(OtherToolCallBlock::new("todo_write", "update")).label_kind(),
             Some(VerbGroupKind::OtherTool)
+        );
+        assert_eq!(
+            ToolCallBlock::Gui(OtherToolCallBlock::new("Click", "Send button")).label_kind(),
+            Some(VerbGroupKind::Gui)
         );
         // Verb-groupable kinds defer to the fold's own classification.
         assert_eq!(

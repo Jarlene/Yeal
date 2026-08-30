@@ -12,6 +12,7 @@ fn vision_ok_png_b64() -> String {
     let mut buf = Vec::new();
     img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
         .expect("encode png");
+    use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(buf)
 }
 fn mcp_screenshot_result(payload_b64: &str) -> ToolRunResult {
@@ -52,6 +53,23 @@ fn followup_has_data_image(followups: &[ConversationItem]) -> bool {
             .any(|p| matches!(p, ContentPart::Image { url } if url.starts_with("data:image/"))),
         _ => false,
     })
+}
+fn gui_observe_result(payload_b64: &str) -> ToolRunResult {
+    use xai_grok_tools::implementations::gui::handler::GuiToolOutput;
+    let url = format!("data:image/png;base64,{payload_b64}");
+    ToolRunResult {
+        output: ToolOutput::Gui(GuiToolOutput {
+            message: "Captured display 1 for visual inspection.".into(),
+            image_url: Some(url.clone()),
+            code_result: serde_json::json!({
+                "message": "Captured display 1 for visual inspection.",
+                "image_url": url,
+            }),
+            success: true,
+        }),
+        prompt_text: "Captured display 1 for visual inspection.".into(),
+        effective_tool_name: None,
+    }
 }
 /// Multimodal: the image drained from the MCP output becomes a deferred vision follow-up; the tool result text keeps the placeholder.
 #[tokio::test(flavor = "current_thread")]
@@ -373,6 +391,71 @@ async fn post_tool_use_rejection_downgrades_only_the_producing_run() {
                 "only the producing run is downgraded; the sibling same-named run stays success \
                  (failed={failed}, success={success}): {:?}",
                 *updates
+            );
+        })
+        .await;
+}
+/// Regression (upstream observe-act-verify loop, PR understudy-ai/codex-cua#3):
+/// a `gui_observe` result must yield at least one model-visible image
+/// (deferred vision follow-up), and the drained output must not keep
+/// carrying the multi-MB screenshot data URL.
+#[tokio::test(flavor = "current_thread")]
+async fn handle_bridge_tool_success_gui_screenshot_deferred_followup() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _) = tokio::sync::mpsc::unbounded_channel::<
+                xai_acp_lib::AcpClientMessage,
+            >();
+            let (persistence_tx, _) = tokio::sync::mpsc::unbounded_channel::<
+                PersistenceMsg,
+            >();
+            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx)
+                .await;
+            assert!(!actor.is_cursor_harness());
+            let payload = vision_ok_png_b64();
+            let parsed_args = serde_json::json!({});
+            let followups = actor
+                .handle_bridge_tool_success(
+                    &acp::ToolCallId::new("tc-gui-img"),
+                    "tc-gui-img",
+                    "gui_observe",
+                    "gui_observe",
+                    DrainedToolSuccess::new(gui_observe_result(&payload)),
+                    0,
+                    "test-model",
+                    &parsed_args,
+                )
+                .await
+                .expect("bridge success");
+            assert!(
+                followup_has_data_image(&followups),
+                "gui_observe must attach the screenshot as a model-visible deferred vision follow-up: {followups:?}"
+            );
+            assert!(
+                followups.iter().any(|item| matches!(
+                    item,
+                    ConversationItem::User(u) if u
+                        .content
+                        .iter()
+                        .any(|p| matches!(p, ContentPart::Text { text } if text.contains("Image extracted from tool result")))
+                )),
+                "expected extracted-image caption: {followups:?}"
+            );
+            let conv = actor.chat_state_handle.get_conversation().await;
+            let tool = conv
+                .iter()
+                .rev()
+                .find(|i| matches!(i, ConversationItem::ToolResult(_)))
+                .expect("tool result pushed");
+            let text = tool_result_text(tool);
+            assert!(
+                text.contains("Captured display 1"),
+                "observe summary stays in tool text: {text}"
+            );
+            assert!(
+                !text.contains("data:image"),
+                "tool text must not reinject data URI: {text}"
             );
         })
         .await;

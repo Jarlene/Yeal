@@ -90,6 +90,11 @@ pub struct PromptContext {
     /// Keeps the plan agent's browser-verification requirement when the prompt is rebuilt.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub include_browser_verification: bool,
+    /// Pre-rendered `## Native GUI Tools` section (upstream codex PR
+    /// understudy-ai/codex-cua#3 `gui_instructions.rs`). `None` unless the
+    /// `gui_tools` feature is enabled; the base template places it verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gui_tools_section: Option<String>,
     /// Which base template to use for `Extend` mode.
     #[serde(default, skip_serializing_if = "is_template_override_none")]
     pub system_prompt: TemplateOverride,
@@ -165,6 +170,7 @@ impl Default for PromptContext {
             audience: PromptAudience::default(),
             prompt_body: None,
             include_browser_verification: false,
+            gui_tools_section: None,
             system_prompt: TemplateOverride::None,
             agents_md_files: vec![],
             persona_summaries: vec![],
@@ -231,6 +237,7 @@ impl PromptContext {
             "is_non_interactive": self.is_non_interactive,
             "system_prompt_label": self.system_prompt_label.as_str(),
             "include_browser_verification": self.include_browser_verification,
+            "gui_tools_section": self.gui_tools_section,
         })
     }
     /// Render the full system prompt via `ToolBridge`. Tool names are resolved inside the bridge.
@@ -309,6 +316,7 @@ mod tests {
             audience: PromptAudience::Primary,
             prompt_body: None,
             include_browser_verification: false,
+            gui_tools_section: None,
             system_prompt: TemplateOverride::None,
             agents_md_files: vec![],
             persona_summaries: vec![],
@@ -620,6 +628,7 @@ mod tests {
             audience: PromptAudience::Subagent,
             prompt_body: Some(subagent_prompts::GENERAL_PURPOSE_PROMPT.to_string()),
             include_browser_verification: false,
+            gui_tools_section: None,
             system_prompt: TemplateOverride::None,
             agents_md_files: vec![],
             persona_summaries: vec![

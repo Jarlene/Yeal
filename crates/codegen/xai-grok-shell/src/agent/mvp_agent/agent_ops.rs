@@ -2371,6 +2371,22 @@ impl MvpAgent {
         }
         WebFetchConfig::Enabled { params }
     }
+    /// Prepare the native GUI tools configuration (upstream codex PR
+    /// understudy-ai/codex-cua#3).
+    ///
+    /// Enabled gate: `[features] gui_tools` / `GROK_GUI_TOOLS` (default off).
+    /// Params come from `[toolset.gui]`; the macOS/Linux advertisement gate is
+    /// applied downstream in `AgentBuilder::build`.
+    pub(super) fn prepare_gui_tools_config(
+        &self,
+    ) -> xai_grok_tools::implementations::gui::GuiToolsConfig {
+        use xai_grok_tools::implementations::gui::GuiToolsConfig;
+        let cfg = self.cfg.borrow();
+        if !cfg.is_feature_enabled(crate::agent::config::Feature::GuiTools) {
+            return GuiToolsConfig::Disabled;
+        }
+        GuiToolsConfig::Enabled(cfg.toolset.gui.resolve_settings())
+    }
     /// Construct from pre-built components.
     /// Use when the caller needs the `ModelsManager` handle externally (e.g. `run_leader` wires it to the config watcher).
     /// Otherwise prefer [`Self::new`].
@@ -4685,6 +4701,7 @@ impl MvpAgent {
         let video_gen_config = self.prepare_video_gen_config();
         let app_builder_deployer_config = self.prepare_app_builder_deployer_config();
         let web_fetch_config = self.prepare_web_fetch_config();
+        let gui_tools_config = self.prepare_gui_tools_config();
         let write_file_enabled = self
             .cfg
             .borrow()
@@ -4942,6 +4959,7 @@ impl MvpAgent {
                     subagent_rate_limit_max_attempts,
                     web_search_sampling_config,
                     web_fetch_config,
+                    gui_tools_config,
                     image_gen_config,
                     video_gen_config,
                     app_builder_deployer_config,

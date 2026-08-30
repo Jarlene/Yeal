@@ -254,6 +254,7 @@ pub(crate) async fn spawn_session_actor(
     subagent_rate_limit_max_attempts: u32,
     web_search_sampling_config: Option<xai_grok_sampler::SamplerConfig>,
     web_fetch_config: xai_grok_tools::implementations::grok_build::web_fetch::WebFetchConfig,
+    gui_tools_config: xai_grok_tools::implementations::gui::GuiToolsConfig,
     image_gen_config: xai_grok_tools::implementations::grok_build::image_gen::ImageGenConfig,
     video_gen_config: xai_grok_tools::implementations::grok_build::video_gen::VideoGenConfig,
     app_builder_deployer_config: xai_grok_tools::implementations::grok_build::app_builder::AppBuilderDeployerConfig,
@@ -1142,6 +1143,14 @@ pub(crate) async fn spawn_session_actor(
         }
         Arc::new(TokioMutex::new(state))
     };
+    // GUI grounding adapter: built when the feature is enabled and the
+    // active model accepts image inputs (upstream gate: InputModality::Image).
+    let gui_grounding_sampler =
+        crate::session::helpers::gui_grounding_sampler::prepare_gui_grounding_sampler(
+            &sampling_config,
+            &models_manager,
+            gui_tools_config.is_enabled(),
+        );
     let plugin_registry = prefetch
         .join_plugin_registry()
         .instrument(tracing::info_span!("spawn.plugin_registry_wait"))
@@ -1183,6 +1192,8 @@ pub(crate) async fn spawn_session_actor(
         web_search_domains,
         backend_search: backend_tools_enabled,
         web_fetch_config: web_fetch_config.clone(),
+        gui_tools_config: gui_tools_config.clone(),
+        gui_grounding_sampler,
         image_gen_config: image_gen_config.clone(),
         video_gen_config: video_gen_config.clone(),
         app_builder_deployer_config: app_builder_deployer_config.clone(),
@@ -2576,6 +2587,7 @@ pub(crate) async fn spawn_session_on_thread(
     subagent_rate_limit_max_attempts: u32,
     web_search_sampling_config: Option<xai_grok_sampler::SamplerConfig>,
     web_fetch_config: xai_grok_tools::implementations::grok_build::web_fetch::WebFetchConfig,
+    gui_tools_config: xai_grok_tools::implementations::gui::GuiToolsConfig,
     image_gen_config: xai_grok_tools::implementations::grok_build::image_gen::ImageGenConfig,
     video_gen_config: xai_grok_tools::implementations::grok_build::video_gen::VideoGenConfig,
     app_builder_deployer_config: xai_grok_tools::implementations::grok_build::app_builder::AppBuilderDeployerConfig,

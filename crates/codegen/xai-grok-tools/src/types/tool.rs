@@ -95,6 +95,9 @@ pub enum ToolKind {
     Monitor,
     GoalUpdate,
     Workflow,
+    /// Native GUI automation (`gui_observe`, `gui_click`, …): semantic
+    /// screen capture + mouse/keyboard control via the Swift helper.
+    Gui,
     Feedback,
     #[serde(other)]
     Other,

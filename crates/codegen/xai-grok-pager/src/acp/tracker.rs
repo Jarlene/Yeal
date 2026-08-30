@@ -7,6 +7,7 @@ use crate::acp::meta::{NotificationMeta, user_message_chunk_meta, user_prompt_me
 use crate::acp::subagent_label_registry::SubagentLabelRegistry;
 use crate::scrollback::block::RenderBlock;
 use crate::scrollback::blocks::SessionEvent;
+use crate::scrollback::blocks::tool::gui;
 use crate::scrollback::blocks::tool::list_dir::ListDirToolCallBlock;
 use crate::scrollback::blocks::tool::search::{
     SearchFileMatch, SearchInputMeta, SearchLineMatch, SearchOutputMode, SearchToolCallBlock,
@@ -2200,6 +2201,7 @@ fn tool_call_to_block(
         {
             media_gen_block(tc, success)
         }
+        _ if is_gui_tool_call(tc) => gui_tool_call_block(tc, success),
         _ if tc.title.starts_with("Memory search:") => {
             let query = tc
                 .title
@@ -2559,6 +2561,59 @@ fn is_workflow_tool(tc: &acp::ToolCall) -> bool {
 fn is_scheduler_tool(tc: &acp::ToolCall) -> bool {
     tc.title.starts_with("scheduler_")
         || extract_variant(tc).is_some_and(|v| v.starts_with("Scheduler"))
+}
+/// Whether a tool call is one of the native GUI tools (macOS/Linux; `gui_*`,
+/// upstream PR understudy-ai/codex-cua#3).
+///
+/// Detected from the parsed `raw_input.variant` tag, falling back to the wire
+/// name in the title for the early Pending notification (whose raw model
+/// arguments carry no tag yet).
+fn is_gui_tool_call(tc: &acp::ToolCall) -> bool {
+    gui::is_gui_variant(extract_variant(tc)) || gui::is_gui_tool_name(&tc.title)
+}
+/// Build the GUI tool-call block.
+///
+/// The shell's refined title ("Click: Send button in `Finder`") becomes the
+/// header and the compact argument summary (coordinates, duration, direction,
+/// modifiers, ...) rides the muted summary span — while the title is still
+/// the raw wire name (early Pending notification), the derived label plus the
+/// full summary are used instead. The typed `ToolOutput::Gui` result supplies
+/// the compact result summary; `success: false` (a model-facing soft failure)
+/// renders like any other failed tool. Typed text is never displayed.
+fn gui_tool_call_block(tc: &acp::ToolCall, status_success: bool) -> RenderBlock {
+    let raw_input = tc.raw_input.clone().unwrap_or(serde_json::Value::Null);
+    let variant = extract_variant(tc)
+        .or_else(|| gui::variant_for_tool_name(&tc.title))
+        .unwrap_or_default();
+    let invocation = gui::summarize_invocation(variant, &raw_input);
+    let title = tc.title.trim();
+    let (name, args_summary) = if title.is_empty() || gui::is_gui_tool_name(title) {
+        (invocation.label.clone(), invocation.join(true))
+    } else {
+        (title.to_string(), invocation.join(false))
+    };
+    let mut block = OtherToolCallBlock::new(name, args_summary);
+    let typed = tc
+        .raw_output
+        .as_ref()
+        .and_then(|raw| gui::summarize_result(raw));
+    let (message, success, screenshot) = match typed {
+        Some(result) => (Some(result.message), result.success, result.has_screenshot),
+        None => (None, status_success, false),
+    };
+    let content = content_text(tc);
+    let message = message.filter(|text| !text.is_empty()).or_else(|| {
+        let text = content.trim();
+        (!text.is_empty()).then(|| text.to_string())
+    });
+    if !success {
+        block.error = Some(message.unwrap_or_else(|| "GUI action failed".to_string()));
+    } else if let Some(message) = message {
+        block.set_output_text(message);
+    } else if screenshot {
+        block.set_output_text("Screenshot captured".to_string());
+    }
+    RenderBlock::ToolCall(ToolCallBlock::Gui(block))
 }
 /// Extract a string field from raw_input JSON.
 fn extract_raw_field(tc: &acp::ToolCall, field: &str) -> Option<String> {

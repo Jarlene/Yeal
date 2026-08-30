@@ -120,6 +120,15 @@ pub fn canonical_input(input: &ToolInput) -> Option<serde_json::Value> {
         | ToolInput::SchedulerList(_)
         | ToolInput::UpdateGoal(_)
         | ToolInput::Workflow(_)
+        | ToolInput::GuiObserve(_)
+        | ToolInput::GuiClick(_)
+        | ToolInput::GuiDrag(_)
+        | ToolInput::GuiScroll(_)
+        | ToolInput::GuiType(_)
+        | ToolInput::GuiKey(_)
+        | ToolInput::GuiMove(_)
+        | ToolInput::GuiWait(_)
+        | ToolInput::GuiBatch(_)
         | ToolInput::Dynamic(_) => return None,
     })
 }

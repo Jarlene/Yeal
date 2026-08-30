@@ -14850,6 +14850,7 @@ name = "xai-grok-tools"
 version = "0.1.220-alpha.4"
 dependencies = [
  "anyhow",
+ "arboard",
  "arc-swap",
  "async-lsp",
  "async-openai",
@@ -14890,6 +14891,8 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "serde_yaml",
+ "serial_test",
+ "sha1",
  "sha2 0.10.9",
  "shellexpand",
  "similar",
@@ -14909,7 +14912,9 @@ dependencies = [
  "which",
  "wildmatch",
  "windows 0.61.3",
+ "windows-sys 0.61.2",
  "wiremock",
+ "x11rb",
  "xai-computer-hub-core",
  "xai-computer-hub-sdk",
  "xai-dirs",

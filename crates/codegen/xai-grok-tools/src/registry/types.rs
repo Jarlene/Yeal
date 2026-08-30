@@ -414,6 +414,10 @@ pub struct FinalizedToolset {
     /// Per-user feature-flag bag stamped on every dispatch ctx by
     /// `prepare_dispatch`. `None` outside a workspace bind.
     workspace_viewer_ctx: Option<xai_tool_runtime::WorkspaceViewerContext>,
+    /// Stable per-session id stamped on every dispatch ctx by
+    /// `prepare_dispatch` so tools can scope state across calls (the GUI
+    /// engine keys observe-state by it, mirroring upstream conversation_id).
+    session_context: Option<xai_tool_runtime::SessionContext>,
 }
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RequirementError {
@@ -627,6 +631,49 @@ impl ToolRegistryBuilder {
         b.register::<grok_build::SendFeedbackTool>();
         b.register::<grok_build::WebSearchTool>();
         b.register_with_params::<grok_build::WebFetchTool, grok_build::web_fetch::WebFetchParams>();
+        // Native GUI tools (upstream codex PR understudy-ai/codex-cua#3). The
+        // shared `GuiToolsSettings` params type carries the resolved
+        // `[toolset.gui]` config into both the advertised schema
+        // (`coordinate_targeting`) and the runtime engine (`Params` resource).
+        // Advertisement is gated in the agent builder (feature flag + macOS);
+        // on other platforms dispatch fails with the unsupported-platform
+        // message via the readiness matrix.
+        b.register_with_params::<
+                crate::implementations::gui::GuiObserveTool,
+                crate::implementations::gui::GuiToolsSettings,
+            >();
+        b.register_with_params::<
+                crate::implementations::gui::GuiClickTool,
+                crate::implementations::gui::GuiToolsSettings,
+            >();
+        b.register_with_params::<
+                crate::implementations::gui::GuiDragTool,
+                crate::implementations::gui::GuiToolsSettings,
+            >();
+        b.register_with_params::<
+                crate::implementations::gui::GuiScrollTool,
+                crate::implementations::gui::GuiToolsSettings,
+            >();
+        b.register_with_params::<
+                crate::implementations::gui::GuiTypeTool,
+                crate::implementations::gui::GuiToolsSettings,
+            >();
+        b.register_with_params::<
+                crate::implementations::gui::GuiKeyTool,
+                crate::implementations::gui::GuiToolsSettings,
+            >();
+        b.register_with_params::<
+                crate::implementations::gui::GuiMoveTool,
+                crate::implementations::gui::GuiToolsSettings,
+            >();
+        b.register_with_params::<
+                crate::implementations::gui::GuiWaitTool,
+                crate::implementations::gui::GuiToolsSettings,
+            >();
+        b.register_with_params::<
+                crate::implementations::gui::GuiBatchTool,
+                crate::implementations::gui::GuiToolsSettings,
+            >();
         b.register::<grok_build::LspTool>();
         b.register::<grok_build::ImageGenTool>();
         b.register::<grok_build::ImageEditTool>();
@@ -938,6 +985,20 @@ impl ToolRegistryBuilder {
         if let Some(owner_session_id) = ctx.owner_session_id.clone() {
             resources.insert(crate::types::resources::OwnerSessionId(owner_session_id));
         }
+        // Stable per-session id for tools that scope state across calls
+        // (e.g. GUI observe-state reuse); subagents prefer their own id.
+        let session_context = match ctx.subagent.as_ref() {
+            Some(subagent) => Some(xai_tool_runtime::SessionContext(
+                subagent.session_id.0.clone(),
+            )),
+            None => ctx
+                .owner_session_id
+                .clone()
+                .map(xai_tool_runtime::SessionContext),
+        };
+        if let Some(session_context) = &session_context {
+            resources.insert(session_context.clone());
+        }
         if let Some(subagent) = ctx.subagent {
             resources.insert(subagent.backend);
             resources.insert(subagent.event_sender);
@@ -1203,6 +1264,7 @@ impl ToolRegistryBuilder {
             renderer: renderer_arc,
             system_reminder_tag: ctx.system_reminder_tag,
             workspace_viewer_ctx,
+            session_context,
         })
     }
 }
@@ -1263,6 +1325,7 @@ impl FinalizedToolset {
             )),
             system_reminder_tag: "system-reminder",
             workspace_viewer_ctx: None,
+            session_context: None,
         }
     }
     pub fn local_registry(&self) -> &xai_computer_hub_sdk::LocalRegistry {
@@ -1436,6 +1499,12 @@ impl FinalizedToolset {
         );
         if let Some(cwd) = parent_ctx.extensions.get::<xai_tool_runtime::Cwd>() {
             ctx.extensions.insert((*cwd).clone());
+        }
+        if let Some(session) = parent_ctx
+            .extensions
+            .get::<xai_tool_runtime::SessionContext>()
+        {
+            ctx.extensions.insert((*session).clone());
         }
         let tool_id = xai_tool_protocol::ToolId::new(&registry_id)
             .unwrap_or_else(|_| xai_tool_protocol::ToolId::new("unknown").expect("valid"));
@@ -1627,6 +1696,9 @@ impl FinalizedToolset {
         )));
         if let Some(wvc) = self.workspace_viewer_ctx.as_ref() {
             ctx.extensions.insert(wvc.clone());
+        }
+        if let Some(session) = self.session_context.as_ref() {
+            ctx.extensions.insert(session.clone());
         }
         let tool_id = xai_tool_protocol::ToolId::new(&registry_id)
             .unwrap_or_else(|_| xai_tool_protocol::ToolId::new("unknown").expect("valid"));
@@ -2109,9 +2181,105 @@ mod tests {
             system_reminder_tag: crate::reminders::DEFAULT_REMINDER_TAG,
         }
     }
-    /// Regression test: `kind_params` must merge input params from ALL tools that share a `ToolKind`, not just the first one. Before the fix, the
-    /// `kind_params` builder used `if map.is_empty()` to seed identity param-name mappings only from the **first** tool of each kind. At runtime,
-    /// the template `${{ params.edit.replace_all }}` failed with "undefined value".
+    /// GUI tools wiring (upstream codex PR understudy-ai/codex-cua#3): the
+    /// `coordinate_targeting` param toggles the advertised schema fields, and
+    /// the full settings ride into Resources as `Params<GuiToolsSettings>` for
+    /// the engine to read at dispatch time.
+    #[tokio::test]
+    async fn gui_tools_advertise_schema_and_runtime_settings_from_params() {
+        use crate::implementations::gui;
+        let tmp = TempDir::new().unwrap();
+        let builder = ToolRegistryBuilder::new();
+        let mut tools = vec![
+            ToolConfig::for_tool::<gui::GuiObserveTool>(),
+            ToolConfig::for_tool::<gui::GuiClickTool>(),
+            ToolConfig::for_tool::<gui::GuiDragTool>(),
+            ToolConfig::for_tool::<gui::GuiScrollTool>(),
+            ToolConfig::for_tool::<gui::GuiTypeTool>(),
+            ToolConfig::for_tool::<gui::GuiKeyTool>(),
+            ToolConfig::for_tool::<gui::GuiMoveTool>(),
+            ToolConfig::for_tool::<gui::GuiWaitTool>(),
+            ToolConfig::for_tool::<gui::GuiBatchTool>(),
+        ];
+        for tc in &mut tools {
+            tc.params = Some(
+                serde_json::json!({ "coordinate_targeting": true })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            );
+        }
+        let config = ToolServerConfig {
+            tools,
+            behavior_preset: None,
+        };
+        let ctx = test_session_context(&tmp);
+        let toolset = Arc::new(
+            builder
+                .finalize(config, ctx)
+                .expect("finalize should succeed with the gui tools configured"),
+        );
+        // Advertised names: the eight core tools plus gui_batch (batch
+        // enabled by default).
+        let names: Vec<String> = toolset
+            .tool_definitions()
+            .into_iter()
+            .map(|d| d.function.name)
+            .collect();
+        for name in [
+            "gui_observe",
+            "gui_click",
+            "gui_drag",
+            "gui_scroll",
+            "gui_type",
+            "gui_key",
+            "gui_move",
+            "gui_wait",
+            "gui_batch",
+        ] {
+            assert!(
+                names.iter().any(|n| n == name),
+                "missing {name} in {names:?}"
+            );
+        }
+        // `coordinate_targeting = true` advertises the experimental
+        // direct-coordinate fields on click and drag.
+        let definitions = toolset.tool_definitions();
+        let click = definitions
+            .iter()
+            .find(|d| d.function.name == "gui_click")
+            .expect("gui_click advertised");
+        let properties = click
+            .function
+            .parameters
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("click schema object");
+        assert!(
+            properties.contains_key("x") && properties.contains_key("coordinate_space"),
+            "coordinate fields missing from advertised gui_click schema"
+        );
+        // The engine reads the same settings at dispatch time.
+        let resources = toolset.resources.lock().await;
+        let settings = resources
+            .get::<crate::types::resources::Params<gui::GuiToolsSettings>>()
+            .expect("gui settings resource inserted at finalize");
+        assert!(settings.coordinate_targeting);
+        assert!(settings.batch_enabled);
+        assert_eq!(settings.batch_grounding_strategy, "parallel");
+        assert_eq!(settings.batch_action_delay_ms, 0);
+    }
+    /// Regression test: `kind_params` must merge input params from ALL tools
+    /// that share a `ToolKind`, not just the first one.
+    ///
+    /// Before the fix, the `kind_params` builder used `if map.is_empty()` to
+    /// seed identity param-name mappings only from the **first** tool of each
+    /// kind. When `codex:apply_patch` (`ToolKind::Edit`, input: `{ patch }`)
+    /// appeared before `grok_build:search_replace` (`ToolKind::Edit`, input:
+    /// `{ file_path, old_string, new_string, replace_all }`), the renderer's
+    /// context had `params.edit = { "patch": "patch" }` — missing
+    /// `replace_all`. At runtime, the template `${{ params.edit.replace_all }}`
+    /// failed with "undefined value".
     #[tokio::test]
     async fn kind_params_merged_across_multiple_tools_of_same_kind() {
         let tmp = TempDir::new().unwrap();
@@ -4892,6 +5060,64 @@ mod tests {
                 .get::<xai_tool_runtime::WorkspaceViewerContext>()
                 .is_none(),
             "no extension must be stamped when workspace_viewer_ctx is None",
+        );
+    }
+    #[tokio::test]
+    async fn prepare_dispatch_stamps_session_context_from_finalize() {
+        let tmp = TempDir::new().unwrap();
+        let builder = ToolRegistryBuilder::new();
+        let config = ToolServerConfig {
+            tools: vec![ToolConfig {
+                id: "GrokBuild:read_file".to_string(),
+                params: None,
+                name_override: None,
+                params_name_overrides: None,
+                description_override: None,
+                behavior_version: None,
+                kind: None,
+            }],
+            behavior_preset: None,
+        };
+        let mut ctx = test_session_context(&tmp);
+        ctx.owner_session_id = Some("session-42".to_string());
+        let toolset = Arc::new(
+            builder
+                .finalize_with_trunc_config(
+                    config,
+                    ctx,
+                    crate::types::context::TruncationConfig::default(),
+                    None,
+                )
+                .expect("finalize succeeds"),
+        );
+        let stored = toolset
+            .resources
+            .lock()
+            .await
+            .get::<xai_tool_runtime::SessionContext>()
+            .map(|s| s.0.clone());
+        assert_eq!(
+            stored.as_deref(),
+            Some("session-42"),
+            "the stable session id must also be readable from Resources"
+        );
+        let parts = toolset
+            .prepare_dispatch(
+                "read_file",
+                serde_json::json!({"target_file": "noop"}),
+                "test-call",
+                None,
+                None,
+            )
+            .expect("prepare_dispatch succeeds");
+        let session = parts
+            .ctx
+            .extensions
+            .get::<xai_tool_runtime::SessionContext>()
+            .expect("SessionContext must be stamped on the ctx");
+        assert_eq!(
+            session.0, "session-42",
+            "every call in one session must share a stable key (GUI observe-state reuse)"
         );
     }
     /// End-to-end: `FinalizedToolset` with `stream_tool_progress: true`

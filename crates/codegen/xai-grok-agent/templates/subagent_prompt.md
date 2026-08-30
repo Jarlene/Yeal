@@ -90,3 +90,7 @@ ${%- if persona_instructions %}
 ${{ persona_instructions }}
 </persona>
 ${%- endif %}
+${%- if gui_tools_section %}
+
+${{ gui_tools_section }}
+${%- endif %}

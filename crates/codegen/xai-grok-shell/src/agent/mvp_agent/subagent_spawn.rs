@@ -305,6 +305,7 @@ impl MvpAgent {
                 }),
             web_search_sampling_config: self.prepare_web_search_sampling_config(),
             web_fetch_config: self.prepare_web_fetch_config(),
+            gui_tools_config: self.prepare_gui_tools_config(),
             image_gen_config: self.prepare_image_gen_config(),
             video_gen_config: self.prepare_video_gen_config(),
             app_builder_deployer_config: self.prepare_app_builder_deployer_config(),

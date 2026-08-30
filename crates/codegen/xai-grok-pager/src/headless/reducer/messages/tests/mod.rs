@@ -213,6 +213,7 @@ fn turn_end(stop_reason: &'static str, result_text: &'static str) -> TurnEnd<'st
 
 mod acp_reducer;
 mod content;
+mod gui;
 mod init;
 mod partial;
 mod result_usage;

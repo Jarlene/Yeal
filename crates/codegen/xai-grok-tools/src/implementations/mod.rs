@@ -4,6 +4,7 @@ pub mod editor_infra;
 pub mod grok_build;
 pub mod grok_build_concise;
 pub mod grok_build_hashline;
+pub mod gui;
 pub mod lsp;
 pub mod memory;
 pub mod opencode;
