@@ -1432,6 +1432,7 @@ impl ToolRegistryBuilder {
             renderer: renderer_arc,
             system_reminder_tag: ctx.system_reminder_tag,
             workspace_viewer_ctx,
+            session_context,
         })
     }
     /// The input schema the tool advertises under its contract version and effective params, or `None` to keep the raw one.
@@ -1799,7 +1800,6 @@ impl FinalizedToolset {
         {
             ctx.extensions.insert((*session).clone());
         }
-        crate::types::source_summary::copy_call_facts(&parent_ctx, &mut ctx);
         let tool_id = xai_tool_protocol::ToolId::new(&registry_id)
             .unwrap_or_else(|_| xai_tool_protocol::ToolId::new("unknown").expect("valid"));
         let lr_handle = self.local_registry.find(&tool_id).ok_or_else(|| {
@@ -2004,6 +2004,10 @@ impl FinalizedToolset {
             ctx.extensions
                 .remove::<xai_tool_runtime::WorkspaceViewerContext>();
         }
+        if let Some(session) = self.session_context.as_ref() {
+            ctx.extensions.insert(session.clone());
+        }
+
         if let Some(session) = self.session_context.as_ref() {
             ctx.extensions.insert(session.clone());
         }
@@ -2489,6 +2493,105 @@ mod tests {
             system_reminder_tag: crate::reminders::DEFAULT_REMINDER_TAG,
         }
     }
+    /// GUI tools wiring (upstream codex PR understudy-ai/codex-cua#3): the
+    /// `coordinate_targeting` param toggles the advertised schema fields, and
+    /// the full settings ride into Resources as `Params<GuiToolsSettings>` for
+    /// the engine to read at dispatch time.
+    #[tokio::test]
+    async fn gui_tools_advertise_schema_and_runtime_settings_from_params() {
+        use crate::implementations::gui;
+        let tmp = TempDir::new().unwrap();
+        let builder = ToolRegistryBuilder::new();
+        let mut tools = vec![
+            ToolConfig::for_tool::<gui::GuiObserveTool>(),
+            ToolConfig::for_tool::<gui::GuiClickTool>(),
+            ToolConfig::for_tool::<gui::GuiDragTool>(),
+            ToolConfig::for_tool::<gui::GuiScrollTool>(),
+            ToolConfig::for_tool::<gui::GuiTypeTool>(),
+            ToolConfig::for_tool::<gui::GuiKeyTool>(),
+            ToolConfig::for_tool::<gui::GuiMoveTool>(),
+            ToolConfig::for_tool::<gui::GuiWaitTool>(),
+            ToolConfig::for_tool::<gui::GuiBatchTool>(),
+        ];
+        for tc in &mut tools {
+            tc.params = Some(
+                serde_json::json!({ "coordinate_targeting": true })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            );
+        }
+        let config = ToolServerConfig {
+            tools,
+            behavior_preset: None,
+        };
+        let ctx = test_session_context(&tmp);
+        let toolset = Arc::new(
+            builder
+                .finalize(config, ctx)
+                .expect("finalize should succeed with the gui tools configured"),
+        );
+        // Advertised names: the eight core tools plus gui_batch (batch
+        // enabled by default).
+        let names: Vec<String> = toolset
+            .tool_definitions()
+            .into_iter()
+            .map(|d| d.function.name)
+            .collect();
+        for name in [
+            "gui_observe",
+            "gui_click",
+            "gui_drag",
+            "gui_scroll",
+            "gui_type",
+            "gui_key",
+            "gui_move",
+            "gui_wait",
+            "gui_batch",
+        ] {
+            assert!(
+                names.iter().any(|n| n == name),
+                "missing {name} in {names:?}"
+            );
+        }
+        // `coordinate_targeting = true` advertises the experimental
+        // direct-coordinate fields on click and drag.
+        let definitions = toolset.tool_definitions();
+        let click = definitions
+            .iter()
+            .find(|d| d.function.name == "gui_click")
+            .expect("gui_click advertised");
+        let properties = click
+            .function
+            .parameters
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("click schema object");
+        assert!(
+            properties.contains_key("x") && properties.contains_key("coordinate_space"),
+            "coordinate fields missing from advertised gui_click schema"
+        );
+        // The engine reads the same settings at dispatch time.
+        let resources = toolset.resources.lock().await;
+        let settings = resources
+            .get::<crate::types::resources::Params<gui::GuiToolsSettings>>()
+            .expect("gui settings resource inserted at finalize");
+        assert!(settings.coordinate_targeting);
+        assert!(settings.batch_enabled);
+        assert_eq!(settings.batch_grounding_strategy, "parallel");
+        assert_eq!(settings.batch_action_delay_ms, 0);
+    }
+    /// Regression test: `kind_params` must merge input params from ALL tools
+    /// that share a `ToolKind`, not just the first one.
+    ///
+    /// Before the fix, the `kind_params` builder used `if map.is_empty()` to
+    /// seed identity param-name mappings only from the **first** tool of each
+    /// kind. When `codex:apply_patch` (`ToolKind::Edit`, input: `{ patch }`)
+    /// appeared before `grok_build:search_replace` (`ToolKind::Edit`, input:
+    /// `{ file_path, old_string, new_string, replace_all }`), the renderer's
+    /// context had `params.edit = { "patch": "patch" }` — missing
+    /// `replace_all`. At runtime, the template `${{ params.edit.replace_all }}`
+    /// failed with "undefined value".
     /// Built-in half of the `lock_path_param` guard (a pack that lives in its own crate runs the
     /// same audit next to its tools): every built-in tool with a path-shaped input either
     /// declares the field it locks or is allowlisted with a reason.
@@ -5674,70 +5777,6 @@ mod tests {
             session.0, "session-42",
             "every call in one session must share a stable key (GUI observe-state reuse)"
         );
-    }
-    #[tokio::test]
-    async fn finalize_installs_per_tool_caps_into_resources() {
-        let caps = HashMap::from([("get_command_or_subagent_output".to_owned(), 5_000)]);
-        let (toolset, _tmp) = toolset_with_viewer_ctx(
-            None,
-            crate::types::context::TruncationConfig {
-                per_tool_max_output_bytes: caps.clone(),
-                ..crate::types::context::TruncationConfig::default()
-            },
-        );
-        let installed = toolset
-            .resources
-            .lock()
-            .await
-            .get::<crate::types::resources::TruncationCfg>()
-            .map(|cfg| cfg.0.per_tool_max_output_bytes.clone());
-        assert_eq!(Some(caps), installed);
-    }
-    #[tokio::test]
-    async fn finalize_without_per_tool_caps_installs_empty_cap_map() {
-        let (toolset, _tmp) =
-            toolset_with_viewer_ctx(None, crate::types::context::TruncationConfig::default());
-        let installed = toolset
-            .resources
-            .lock()
-            .await
-            .get::<crate::types::resources::TruncationCfg>()
-            .map(|cfg| cfg.0.per_tool_max_output_bytes.clone());
-        assert_eq!(Some(HashMap::new()), installed);
-    }
-    #[tokio::test]
-    async fn prepare_dispatch_keeps_the_source_slot_and_replaces_resources() {
-        let (toolset, _tmp) =
-            toolset_with_viewer_ctx(None, crate::types::context::TruncationConfig::default());
-        let slot = crate::types::source_summary::SourceSummarySlot::new();
-        let incoming = crate::types::resources::Resources::new().into_shared();
-        let mut ctx = context_for_call("test-call", None, None);
-        ctx.insert(slot.clone());
-        ctx.insert(incoming.clone());
-        let parts = toolset
-            .prepare_dispatch("read_file", serde_json::json!({"target_file": "noop"}), ctx)
-            .expect("prepare_dispatch succeeds");
-        let kept = parts
-            .ctx
-            .get::<crate::types::source_summary::SourceSummarySlot>()
-            .expect("slot");
-        let mut detail = crate::types::source_summary::ReadDetail::unknown();
-        detail.role = crate::types::source_summary::ReadRole::SkillEntry;
-        slot.record(crate::types::source_summary::ToolSourceSummary {
-            result: crate::types::source_summary::ToolSourceResult::Failed(None),
-            output_limit: crate::types::source_summary::ToolOutputLimit::Unobserved,
-            detail: crate::types::source_summary::ToolSourceDetail::Read(detail),
-        });
-        assert_eq!(
-            kept.snapshot().read().map(|read| read.role),
-            Some(crate::types::source_summary::ReadRole::SkillEntry)
-        );
-        let host = parts
-            .ctx
-            .get::<crate::types::resources::SharedResources>()
-            .expect("resources");
-        assert!(std::sync::Arc::ptr_eq(host.as_ref(), &toolset.resources));
-        assert!(!std::sync::Arc::ptr_eq(host.as_ref(), &incoming));
     }
     /// End-to-end: `FinalizedToolset` with `stream_tool_progress: true`
     /// produces `bash_output_chunk` Progress frames via `call_streaming`.

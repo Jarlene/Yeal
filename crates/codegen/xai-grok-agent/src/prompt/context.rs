@@ -95,6 +95,11 @@ pub struct PromptContext {
     /// `gui_tools` feature is enabled; the base template places it verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gui_tools_section: Option<String>,
+    /// Pre-rendered `## Native GUI Tools` section (upstream codex PR
+    /// understudy-ai/codex-cua#3 `gui_instructions.rs`). `None` unless the
+    /// `gui_tools` feature is enabled; the base template places it verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gui_tools_section: Option<String>,
     /// Which base template to use for `Extend` mode.
     #[serde(default, skip_serializing_if = "is_template_override_none")]
     pub system_prompt: TemplateOverride,

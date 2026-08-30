@@ -329,6 +329,14 @@ pub const FEATURES: &[FeatureSpec] = &[
         remote: None,
     },
     FeatureSpec {
+        id: Feature::GuiTools,
+        key: "gui_tools",
+        path: "features.gui_tools",
+        env: "GROK_GUI_TOOLS",
+        default_enabled: false,
+        remote: None,
+    },
+    FeatureSpec {
         id: Feature::TerminalTheme,
         key: "terminal_theme",
         path: "features.terminal_theme",

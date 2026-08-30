@@ -13,13 +13,11 @@ use std::time::Duration;
 
 use base64::Engine as _;
 
-use crate::agent::remote_config::ModelsManager;
+use crate::agent::models::ModelsManager;
 use crate::sampling::Client as OaiCompatClient;
 use crate::sampling::ConversationRequest;
 use crate::sampling::SamplerConfig;
-use xai_grok_sampling_types::conversation::{
-    ContentPart, ConversationItem, SyntheticReason, SystemItem, UserItem,
-};
+use xai_grok_sampling_types::conversation::{ContentPart, ConversationItem, SystemItem, UserItem};
 use xai_grok_tools::implementations::gui::grounding::GuiGroundingModelImage;
 use xai_grok_tools::implementations::gui::grounding::GuiGroundingModelRequest;
 use xai_grok_tools::implementations::gui::grounding::GuiGroundingSampler;
@@ -66,7 +64,6 @@ impl GuiGroundingSampler for ShellGuiGroundingSampler {
         let items = vec![
             ConversationItem::System(SystemItem {
                 content: std::sync::Arc::<str>::from(request.system_prompt.as_str()),
-                synthetic_reason: SyntheticReason::Primary,
             }),
             ConversationItem::User(UserItem {
                 content: parts,
