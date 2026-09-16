@@ -3778,6 +3778,12 @@ pub struct ModelEntryConfig {
     /// Per-model opt-in: BYOK endpoints that don't understand the flag should leave this unset to avoid request errors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_tool_calls: Option<bool>,
+    /// Whether the model accepts image inputs (upstream GUI grounding gate:
+    /// codex `InputModality::Image`). `None`/omitted = assumed supported;
+    /// `Some(false)` marks keyboard-only models and disables semantic GUI
+    /// grounding plus screenshot attachment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_input: Option<bool>,
     /// Responses API `reasoning.summary` for this model; unset keeps the built-in `concise`.
     /// `none` omits the field for BYOK gateways that reject it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3828,6 +3834,7 @@ impl Default for ModelEntryConfig {
             compaction_at_tokens: None,
             show_model_fingerprint: false,
             stream_tool_calls: None,
+            image_input: None,
             reasoning_summary: None,
             laziness_detector: LazinessDetectorPerModelConfig::default(),
         }

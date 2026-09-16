@@ -2797,6 +2797,7 @@ pub(crate) async fn spawn_session_on_thread(
                     subagent_rate_limit_max_attempts,
                     web_search_sampling_config,
                     web_fetch_config,
+                    gui_tools_config,
                     image_gen_config,
                     video_gen_config,
                     app_builder_deployer_config,
