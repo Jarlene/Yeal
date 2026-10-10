@@ -20,6 +20,7 @@ use xai_grok_agent::plugins::git_install::{self, UpdateStatus};
 use xai_grok_agent::plugins::install_registry::{
     InstallError, InstallKind, InstallRegistry, InstalledRepo,
 };
+use xai_grok_agent::plugins::source_identity::normalize_git_url;
 use xai_grok_plugin_marketplace::git;
 use xai_grok_plugin_marketplace::{
     MarketplaceEntry, MarketplaceRelativePath, MarketplaceSource, SourceKind, install_resolve,
@@ -468,8 +469,7 @@ fn registry_update_error(e: acquire::UpdateAcquireError, plugin_subdir: String) 
 }
 
 /// Expand GitHub shorthand (user/repo) to `https://github.com/user/repo.git`.
-/// Distinct from the workspace canonicalizer (`permission::resolution::normalize_git_url`), which
-/// normalizes existing URLs instead of expanding shorthand.
+/// Distinct from [`normalize_git_url`], which normalizes existing URLs instead of expanding shorthand.
 pub fn expand_github_shorthand(input: &str) -> String {
     if !input.contains("://") && !input.contains("git@") {
         format!("https://github.com/{}.git", input.trim_end_matches(".git"))
@@ -1183,7 +1183,7 @@ pub fn add_marketplace_source(
     if let Some(parent) = config_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let existing = crate::util::config::read_to_string_or_empty(config_path)?;
+    let (dest, existing) = crate::util::config::read_follow_bound(config_path)?;
     let mut doc = existing.parse::<toml_edit::DocumentMut>().map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1215,7 +1215,6 @@ pub fn add_marketplace_source(
     // dup check can let two serialized adds reach here.
     let already_present = match source {
         MarketplaceAddInput::GitUrl(git_url) => {
-            use xai_grok_workspace::permission::resolution::normalize_git_url;
             let normalized = normalize_git_url(git_url);
             sources.iter().any(|t| {
                 t.get("git")
@@ -1253,7 +1252,7 @@ pub fn add_marketplace_source(
         );
     }
 
-    crate::util::config::atomic_write_string(config_path, &doc.to_string())
+    crate::util::config::atomic_write_follow_bound(config_path, &dest, &doc.to_string())
 }
 
 /// Remove a `[[marketplace.sources]]` entry matching `git` or `path`.
@@ -1268,7 +1267,6 @@ pub fn remove_toml_marketplace_block(content: &str, source_identity: &str) -> Op
 
     // Full git-URL normalization (.git, host case, scp-vs-https): a different spelling of the
     // configured source must still match, or the remove leaves the entry behind.
-    use xai_grok_workspace::permission::resolution::normalize_git_url;
     let identity_normalized = normalize_git_url(source_identity);
     let idx = sources.iter().position(|entry| {
         if let Some(git) = entry.get("git").and_then(|v| v.as_str()) {
@@ -1322,14 +1320,14 @@ pub fn remove_marketplace_source_from_stores(
     source_identity: &str,
 ) -> std::io::Result<MarketplaceSourceRemoval> {
     let is_official = is_official_source_url(source_identity);
-    let content = crate::util::config::read_to_string_or_empty(config_path)?;
+    let (dest, content) = crate::util::config::read_follow_bound(config_path)?;
     if let Some(removed) = remove_toml_marketplace_block(&content, source_identity) {
         let final_content = if is_official {
             set_official_flag_in_toml(&removed)?
         } else {
             removed
         };
-        crate::util::config::atomic_write_string(config_path, &final_content)?;
+        crate::util::config::atomic_write_follow_bound(config_path, &dest, &final_content)?;
         return Ok(MarketplaceSourceRemoval::ConfigToml);
     }
     if try_remove_source_from_json_files(source_identity) {
@@ -1379,9 +1377,9 @@ pub(crate) fn set_marketplace_bool_flag(config_path: &Path, key: &str) -> std::i
     if let Some(parent) = config_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let existing = crate::util::config::read_to_string_or_empty(config_path)?;
+    let (dest, existing) = crate::util::config::read_follow_bound(config_path)?;
     let updated = set_marketplace_bool_flag_in_toml(&existing, key)?;
-    crate::util::config::atomic_write_string(config_path, &updated)
+    crate::util::config::atomic_write_follow_bound(config_path, &dest, &updated)
 }
 
 pub(crate) fn set_official_flag_in_toml(content: &str) -> std::io::Result<String> {

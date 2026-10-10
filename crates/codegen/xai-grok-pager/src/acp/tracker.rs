@@ -33,6 +33,7 @@ use xai_grok_shell::session::storage::chunk_meta_flag;
 use xai_grok_tools::types::output::{BashOutput, ToolOutput};
 use xai_grok_tools::types::output::{ReadFileOutput, SearchToolOutput, WebFetchOutput};
 use xai_grok_tools::util::strip_redundant_session_cd;
+use xai_tool_types::{ReadLineCounts, parse_lenient_u64_value};
 /// Convert a UTC millisecond timestamp to local time.
 fn utc_ms_to_local(ms: i64) -> DateTime<Local> {
     chrono::Utc
@@ -49,8 +50,8 @@ pub enum WaitingReason {
     /// Waiting for the model to (re)start streaming.
     /// This covers the gap before the first token after the prompt is sent, and the gap after a tool completes before the next inference step begins.
     Model,
-    /// Blocked on a running foreground subagent (`task` / `spawn_subagent`). The view fills it in; the tracker always
-    /// leaves it `None`.
+    /// Blocked on a running foreground subagent (`task` / `spawn_subagent`).
+    /// Only the view sets `display`, to `Waiting for subagent` or `Waiting for N subagents`.
     Subagent { display: Option<String> },
     /// Blocked polling/awaiting a background task's output (`get_command_or_subagent_output` / `get_task_output`). The
     /// tracker itself always leaves it `None`.
@@ -88,6 +89,15 @@ pub fn clamp_activity_subject(s: &str) -> String {
         line.chars().take(MAX_ACTIVITY_SUBJECT_CHARS).collect()
     }
 }
+/// `n == 0` is treated as 1: a `Subagent` wait means at least one child.
+pub fn waiting_on_subagents_subject(n: usize) -> String {
+    let n = n.max(1);
+    if n == 1 {
+        "Waiting for subagent".to_string()
+    } else {
+        format!("Waiting for {n} subagents")
+    }
+}
 /// Shared in-progress subject label (clamped description/command) used by turn-status, title bar, and dashboard/subagent activity columns.
 ///
 /// Renders as `{subject}…` (no "Waiting for" prefix or quotes) so a description like `Wait 5 seconds` reads cleanly next to the spinner.
@@ -116,10 +126,14 @@ impl WaitingReason {
     pub fn label(&self) -> String {
         match self {
             Self::Model => "Waiting for response…".to_string(),
-            Self::Subagent { display } => match display.as_deref().map(clamp_activity_subject) {
-                Some(display) if !display.is_empty() => format!("{display}…"),
-                _ => "Waiting on subagent…".to_string(),
-            },
+            Self::Subagent { display } => {
+                let subject = display
+                    .as_deref()
+                    .map(clamp_activity_subject)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| waiting_on_subagents_subject(1));
+                format!("{subject}…")
+            }
             Self::TaskOutput {
                 subject: Some(subject),
                 ..
@@ -1495,6 +1509,11 @@ impl AcpUpdateTracker {
                 scrollback.finish_running(entry_id);
             }
         }
+        if self.skip_next_user_echo
+            && chunk_meta_flag(&chunk, user_message_chunk_meta::HIDE_FROM_SCROLLBACK)
+        {
+            return false;
+        }
         if self.skip_next_user_echo {
             self.skip_next_user_echo = false;
             if text.contains("<command-name>") {
@@ -1859,11 +1878,12 @@ fn tool_call_to_block(
             if is_memory_v2_activity(tc) {
                 block = block.with_memory_activity();
             }
-            if let Some(ref raw) = tc.raw_output
-                && let Ok(ToolOutput::ReadFile(read_output)) =
-                    serde_json::from_value::<ToolOutput>(raw.clone())
-            {
-                match read_output {
+            let structured = tc
+                .raw_output
+                .as_ref()
+                .map(|raw| serde_json::from_value::<ToolOutput>(raw.clone()));
+            match structured {
+                Some(Ok(ToolOutput::ReadFile(read_output))) => match read_output {
                     ReadFileOutput::FileContent(fc) => {
                         if fc.offset.is_some() || fc.limit.is_some() {
                             let off = fc.offset.unwrap_or(0);
@@ -1893,14 +1913,33 @@ fn tool_call_to_block(
                             pages: pdf.total_pages,
                         });
                     }
+                },
+                _ if !success => {
+                    let text = content_text(tc);
+                    block = block.with_error(if text.is_empty() {
+                        "Read failed".to_string()
+                    } else {
+                        text
+                    });
                 }
-            } else if !success {
-                let text = content_text(tc);
-                block = block.with_error(if text.is_empty() {
-                    "Read failed".to_string()
-                } else {
-                    text
-                });
+                Some(Ok(_)) => {}
+                None | Some(Err(_)) => {
+                    let counts = tc
+                        .raw_output
+                        .as_ref()
+                        .and_then(|raw| serde_json::from_value::<ReadLineCounts>(raw.clone()).ok())
+                        .unwrap_or_default();
+                    if let Some(range) = counts.range {
+                        block = block.with_line_range(LineRange::new(range.start, range.end));
+                    }
+                    block.total_lines = counts.total_lines;
+                    if has_text_content(tc) {
+                        let text = content_text(tc);
+                        let total_lines =
+                            counts.total_lines.unwrap_or_else(|| text.lines().count());
+                        block = block.with_content(text, total_lines);
+                    }
+                }
             }
             RenderBlock::ToolCall(ToolCallBlock::Read(block))
         }
@@ -1952,6 +1991,7 @@ fn tool_call_to_block(
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
             let query = extract_raw_field(tc, "query")
+                .or_else(|| extract_raw_field(tc, "search_term"))
                 .or_else(|| {
                     tc.title
                         .strip_prefix("Web search: ")
@@ -2062,7 +2102,7 @@ fn tool_call_to_block(
                     }
                     block.citations = ws.citations;
                 }
-                if block.content.is_none() {
+                if success && block.content.is_none() {
                     let text = content_text(tc);
                     if !text.is_empty() {
                         block.content = Some(text);
@@ -2070,7 +2110,7 @@ fn tool_call_to_block(
                 }
             }
             if !success {
-                block = block.with_error("Web search failed");
+                block = block.with_error(failure_reason(tc, "Web search failed"));
             }
             RenderBlock::ToolCall(ToolCallBlock::WebSearch(block))
         }
@@ -2089,7 +2129,7 @@ fn tool_call_to_block(
             block.file_matches = grep.file_matches;
             block.file_paths = grep.file_paths;
             if !success {
-                block.error = Some("Search failed".into());
+                block.error = Some(failure_reason(tc, "Search failed"));
             }
             RenderBlock::ToolCall(ToolCallBlock::Search(block))
         }
@@ -2149,7 +2189,12 @@ fn tool_call_to_block(
                 block.content = Some(content);
             }
             if !success {
-                block = block.with_error("Search failed");
+                let error = block
+                    .content
+                    .take()
+                    .filter(|_| block.results.is_empty())
+                    .unwrap_or_else(|| "Search failed".to_owned());
+                block = block.with_error(error);
             }
             RenderBlock::ToolCall(ToolCallBlock::IntegrationSearch(block))
         }
@@ -2368,6 +2413,27 @@ fn extract_text_from_content(content: &acp::ContentBlock) -> String {
 fn content_text(tc: &acp::ToolCall) -> String {
     content_blocks_text(&tc.content)
 }
+/// A search streams nothing, so a failed one's content is the reason; `default` covers an empty one
+fn failure_reason(tc: &acp::ToolCall, default: &str) -> String {
+    let reason = content_text(tc);
+    if reason.is_empty() {
+        default.to_owned()
+    } else {
+        reason
+    }
+}
+/// True when at least one content block is text, even empty text (an empty file read)
+fn has_text_content(tc: &acp::ToolCall) -> bool {
+    tc.content.iter().any(|c| {
+        matches!(
+            c,
+            acp::ToolCallContent::Content(acp::Content {
+                content: acp::ContentBlock::Text(_),
+                ..
+            })
+        )
+    })
+}
 pub(crate) fn content_blocks_text(content: &[acp::ToolCallContent]) -> String {
     content
         .iter()
@@ -2478,19 +2544,32 @@ fn task_ids_from_raw_input(raw: &serde_json::Value) -> Vec<String> {
     }
     out
 }
-/// Check if a tool call is a background execute (`is_background=true`). These are deferred from scrollback; the
-/// `x.ai/task_backgrounded` notification creates a `BgTask` block instead of an `Execute` block. Still treat those
-/// as execute tools when `raw_input` requests background so we don't flash the function name.
+/// True when an execute tool call asked to run in the background.
+/// Scrollback skips these; the `x.ai/task_backgrounded` notification adds a `BgTask` block for them.
 fn is_bg_tool(tc: &acp::ToolCall) -> bool {
     let looks_like_execute =
         tc.kind == acp::ToolKind::Execute || is_execute_tool_function_name(&tc.title);
-    looks_like_execute
-        && tc
-            .raw_input
-            .as_ref()
-            .and_then(|v| v.get("is_background").or_else(|| v.get("background")))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
+    if !looks_like_execute {
+        return false;
+    }
+    let Some(input) = tc.raw_input.as_ref() else {
+        return false;
+    };
+    raw_input_requests_background(input)
+}
+/// Uses the same precedence as `BashTool::resolve_block_until_ms`.
+/// An explicit `block_until_ms` wins over the legacy flags and `timeout: 0`.
+fn raw_input_requests_background(input: &serde_json::Value) -> bool {
+    let ms = |key: &str| input.get(key).and_then(|v| parse_lenient_u64_value(v).ok());
+    if let Some(block) = ms("block_until_ms") {
+        return block == 0;
+    }
+    let legacy_flag = input
+        .get("is_background")
+        .or_else(|| input.get("background"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    legacy_flag || ms("timeout") == Some(0)
 }
 /// Check if an Edit-kind tool call is a whole-file write (write) rather than a targeted replacement (search_replace / edit).
 ///
@@ -2623,7 +2702,7 @@ fn extract_raw_field(tc: &acp::ToolCall, field: &str) -> Option<String> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
 }
-/// Extract a short, user-friendly error label from a failed Edit tool call.
+/// The error shown on a failed Edit block: a short label for a structured search_replace output, else the text content
 fn extract_edit_error(tc: &acp::ToolCall) -> String {
     use xai_grok_tools::types::output::SearchReplaceOutput;
     if let Some(ref raw) = tc.raw_output
@@ -2639,7 +2718,10 @@ fn extract_edit_error(tc: &acp::ToolCall) -> String {
             SearchReplaceOutput::EditsApplied(_) => "Edit failed".to_owned(),
         };
     }
-    "Edit failed".to_owned()
+    match content_text(tc) {
+        text if text.is_empty() => "Edit failed".to_owned(),
+        text => text,
+    }
 }
 /// Extract search input metadata from a tool call's rawInput.
 fn extract_search_meta(tc: &acp::ToolCall) -> SearchInputMeta {

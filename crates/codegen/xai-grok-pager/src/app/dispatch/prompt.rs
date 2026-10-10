@@ -8,7 +8,7 @@ use super::billing::is_credit_limit_error;
 use super::ctx::{get_active_agent_mut, visible_agent_mut, with_active_agent};
 use super::interject;
 use super::queue::{
-    apply_turn_start_shim, drain_prompt_state_to_last_queued, immediate_server_send_eligible,
+    apply_turn_start_shim, attach_prompt_state_to_last_queued, immediate_server_send_eligible,
     maybe_drain_queue, note_peek_page_flip, push_and_page_flip, push_server_queue_echo,
     retire_optimistic_echo,
 };
@@ -22,7 +22,7 @@ use crate::app::app_view::{ActiveView, AppView};
 use crate::app::cancel_latency::TurnEnd;
 use crate::notifications::{NotificationEvent, NotificationEventKind};
 use crate::scrollback::block::RenderBlock;
-use crate::scrollback::blocks::SessionEvent;
+use crate::scrollback::blocks::{MemoryCommandKind, SessionEvent};
 use crate::slash::command::DoctorRequest;
 use agent_client_protocol as acp;
 use xai_grok_telemetry::session_ctx::log_event;
@@ -219,6 +219,32 @@ pub(super) fn dispatch_execute_plan(
         plan_file_content,
         plan_file_uri,
     }]
+}
+
+pub(in crate::app::dispatch) const LOAD_FAILED_NOTICE: &str =
+    "This session didn't open. Open it again with /resume, or start a new one with /new.";
+
+/// A tab whose session never opened has nothing to send to, so its prompt or command would queue forever.
+fn refuse_if_load_failed(app: &mut AppView, id: AgentId) -> bool {
+    let minimal = app.screen_mode.is_minimal();
+    app.agents
+        .get_mut(&id)
+        .is_some_and(|agent| refuse_on_failed_tab(agent, minimal))
+}
+
+/// Minimal mode shows no toasts, so the notice goes to the scrollback there.
+fn refuse_on_failed_tab(agent: &mut AgentView, minimal: bool) -> bool {
+    if !agent.load_failed {
+        return false;
+    }
+    if minimal {
+        agent
+            .scrollback
+            .push_block(RenderBlock::system(LOAD_FAILED_NOTICE.to_owned()));
+    } else {
+        agent.show_toast(LOAD_FAILED_NOTICE);
+    }
+    true
 }
 
 pub(super) fn dispatch_send_prompt(app: &mut AppView, text: String) -> Vec<Effect> {
@@ -643,6 +669,13 @@ pub(super) fn dispatch_send_prompt_submission(
         }
         return prelude;
     };
+    // A slash command is refused below only if it would queue, so `/new`, `/resume`, and `exit` still run
+    let runs_locally = !literal
+        && (text.trim().starts_with('/')
+            || crate::slash::commands::exit::is_exit_alias(text.trim()));
+    if !runs_locally && refuse_if_load_failed(app, id) {
+        return prelude;
+    }
     // Match the later slash path: only a line that itself starts with `/` is a command.
     // Chip-stripped text can look like `/feedback` after a leading image without being one.
     if !literal && text.trim().starts_with('/') {
@@ -698,8 +731,10 @@ pub(super) fn dispatch_send_prompt_submission(
     let auto_mode_gate_from_app = app.auto_mode_gate;
     let ask_user_question_timeout_enabled_from_app = app.ask_user_question_timeout_enabled;
     let voice_stt_language_from_app = app.voice_config.language.clone();
+    let subagent_model_inheritance_from_app = app.subagent_model_inheritance;
     let login_method_id_from_app = app.login_method_id.as_ref().map(|id| id.0.to_string());
     let leader_mode = app.leader_mode;
+    let screen_mode_is_minimal = app.screen_mode.is_minimal();
     let Some(agent) = app.agents.get_mut(&id) else {
         return prelude;
     };
@@ -712,6 +747,13 @@ pub(super) fn dispatch_send_prompt_submission(
         return prelude;
     }
 
+    // Orphan `[Image #N]` text (yank, plain paste) must be bound before the chip strip below and the
+    // route decision read the composer; a deferred resubmit carries its images in `submission`. The
+    // unbound notice waits until the text is accepted, so a refusal keeps its own toast.
+    if consume_input && submission.is_none() {
+        agent.prompt.rebind_image_placeholders();
+    }
+
     // Submitting the prompt retires any edit-contextual ephemeral tip (ambient tips live out their TTL across the submit)
     agent.ephemeral_tip.clear_on_submit();
 
@@ -719,14 +761,31 @@ pub(super) fn dispatch_send_prompt_submission(
         || agent.prompt.submitted_text_without_image_chips(&text),
         |submission| submission.text_without_image_chips(),
     );
-    // The raw text decides command-ness, like the slash branch below; a stripped ` /btw q` hoists.
-    let hoisted = if literal || text.trim().starts_with('/') {
-        None
-    } else {
+    // Raw text decides command-ness so a chip-stripped ` /btw q` still hoists.
+    // `/goal` is checked on that typed line first; `/btw` hoist would bury it.
+    let is_plain_submission = !literal && !text.trim().starts_with('/');
+    if is_plain_submission
+        && crate::slash::mid_text_hoist::contains_goal_command_token(
+            &slash_input,
+            agent.prompt.slash_controller.registry(),
+        )
+    {
+        if screen_mode_is_minimal {
+            agent.scrollback.push_block(RenderBlock::system(
+                crate::slash::mid_text_hoist::MID_TEXT_GOAL_NOTICE.to_owned(),
+            ));
+        } else {
+            agent.show_toast(crate::slash::mid_text_hoist::MID_TEXT_GOAL_NOTICE);
+        }
+        return prelude;
+    }
+    let hoisted = if is_plain_submission {
         crate::slash::mid_text_hoist::hoist_mid_text_command(
             &slash_input,
             agent.prompt.slash_controller.registry(),
         )
+    } else {
+        None
     };
 
     // Recorded before the registry runs, because most command outcomes return on their own path.
@@ -813,6 +872,7 @@ pub(super) fn dispatch_send_prompt_submission(
                     auto_mode_gate: auto_mode_gate_from_app,
                     ask_user_question_timeout_enabled: ask_user_question_timeout_enabled_from_app,
                     voice_stt_language: voice_stt_language_from_app,
+                    subagent_model_inheritance: subagent_model_inheritance_from_app,
                 },
             };
 
@@ -866,59 +926,18 @@ pub(super) fn dispatch_send_prompt_submission(
         };
 
         // Map CommandResult to pager behavior. (MRU persistence is queued off-thread inside `record_command_use` above.)
-        match exec_result {
-            CommandResult::Handled => {
-                if consume_input {
-                    agent.prompt.set_text("");
-                }
-                return effects;
-            }
-            CommandResult::Error(msg) => {
-                if consume_input {
-                    agent.prompt.set_text("");
-                }
-                push_and_page_flip(&mut agent.scrollback, RenderBlock::system(msg));
-                return effects;
-            }
-            CommandResult::Message(msg) => {
-                if consume_input {
-                    agent.prompt.set_text("");
-                }
-                push_and_page_flip(&mut agent.scrollback, RenderBlock::system(msg));
-                return effects;
-            }
-            CommandResult::Doctor(request) => {
-                if consume_input {
-                    agent.prompt.set_text("");
-                }
-                effects.extend(dispatch_doctor(request, app));
-                return effects;
-            }
-            CommandResult::Action(Action::ExitSession) => {
-                if consume_input {
-                    agent.prompt.set_text("");
-                }
-                effects.extend(dispatch(Action::ExitSession, app));
-                return effects;
-            }
-            CommandResult::Action(Action::EditPromptExternal) => {
-                // Typed slash input occupies the composer; the palette route preserves an existing draft.
-                if consume_input {
-                    agent.prompt.set_text("");
-                }
-                effects.extend(dispatch(Action::EditPromptExternal, app));
-                return effects;
-            }
-            CommandResult::Action(Action::SendRememberNote(note)) => {
-                if consume_input {
-                    agent.prompt.set_text("");
-                }
-                // The typed `/remember <text>` is the row already recorded above.
-                effects.extend(super::notes::dispatch_send_remember_note_from_command(
-                    app, note,
-                ));
-                return effects;
-            }
+        // The feedback modal owns the composer only once it accepts the open, so it settles before the
+        // shared image disposition below.
+        if matches!(
+            exec_result,
+            CommandResult::QueueCommand(_)
+                | CommandResult::InjectSkill { .. }
+                | CommandResult::PassThrough(_)
+        ) && refuse_on_failed_tab(agent, app.screen_mode.is_minimal())
+        {
+            return effects;
+        }
+        let exec_result = match exec_result {
             CommandResult::Action(Action::OpenFeedbackModal(mut open)) => {
                 // Composer chips stay put until this open is accepted. A no-session
                 // or blocker refusal drops `open`, and FeedbackImages Drop would
@@ -959,25 +978,93 @@ pub(super) fn dispatch_send_prompt_submission(
                 effects.extend(rehydrate);
                 return effects;
             }
-            CommandResult::Action(mut action) => {
-                let mut submitted_images = submission
-                    .map(|submission| submission.into_submission().1)
-                    .unwrap_or_default();
+            other => other,
+        };
+
+        // One snapshot re-binds orphan placeholders and then owns the chips and images; the composer's
+        // image state is not read again below.
+        let mut submitted_images = submission
+            .map(|submission| submission.into_submission().1)
+            .unwrap_or_default();
+        let carries_images = matches!(
+            exec_result,
+            CommandResult::Action(Action::SendFeedback { .. } | Action::SendBtw { .. })
+        );
+        let queues = matches!(
+            exec_result,
+            CommandResult::QueueCommand(_)
+                | CommandResult::InjectSkill { .. }
+                | CommandResult::PassThrough(_)
+        );
+        // The typed text reaches a model as a queued row or as the `/btw` side question; a feedback
+        // report is not a model send.
+        let sends_typed_text =
+            queues || matches!(exec_result, CommandResult::Action(Action::SendBtw { .. }));
+        let mut chip_elements = Vec::new();
+        if consume_input {
+            // Read the placeholders before the snapshot drains the records they are checked against.
+            if sends_typed_text {
+                app.pending_image_notices
+                    .extend(agent.unbound_image_placeholder_notice());
+            }
+            let (_, images, chips) = agent.prompt.stash().into_submission();
+            submitted_images.extend(images);
+            chip_elements = chips;
+        }
+        // The notice is queued now and shown when this dispatch ends, after any toast the command sets.
+        if !carries_images && !queues && !submitted_images.is_empty() {
+            let command = parse_invocation(trimmed).map_or("", |inv| inv.token);
+            app.pending_image_notices
+                .push(agent.images_dropped_by_command_notice(
+                    submitted_images.len(),
+                    crate::app::agent_view::ImagesDroppedBy::SlashAction(command.to_owned()),
+                ));
+            crate::prompt_images::drain_and_cleanup(
+                crate::prompt_images::SessionPathPolicy::Preserve,
+                &mut submitted_images,
+            );
+        }
+        match exec_result {
+            CommandResult::Handled => {
                 if consume_input {
-                    submitted_images.extend(agent.prompt.drain_images());
+                    agent.prompt.set_text("");
                 }
+                return effects;
+            }
+            CommandResult::Error(msg) | CommandResult::Message(msg) => {
+                if consume_input {
+                    agent.prompt.set_text("");
+                }
+                push_and_page_flip(&mut agent.scrollback, RenderBlock::system(msg));
+                return effects;
+            }
+            CommandResult::Doctor(request) => {
+                if consume_input {
+                    agent.prompt.set_text("");
+                }
+                effects.extend(dispatch_doctor(request, app));
+                return effects;
+            }
+            CommandResult::Action(Action::SendRememberNote(note)) => {
+                if consume_input {
+                    agent.prompt.set_text("");
+                }
+                // The typed `/remember <text>` is the row already recorded above.
+                effects.extend(super::notes::dispatch_send_remember_note_from_command(
+                    app, note,
+                ));
+                return effects;
+            }
+            CommandResult::Action(mut action) => {
                 match &mut action {
                     Action::SendFeedback { images, .. } => {
-                        *images = submitted_images.into();
+                        *images = std::mem::take(&mut submitted_images).into();
                     }
                     // Same as feedback: these images are the question, not leftover chips.
                     Action::SendBtw { images, .. } => {
-                        *images = submitted_images;
+                        *images = std::mem::take(&mut submitted_images);
                     }
-                    _ => crate::prompt_images::drain_and_cleanup(
-                        crate::prompt_images::SessionPathPolicy::Preserve,
-                        &mut submitted_images,
-                    ),
+                    _ => {}
                 }
                 if consume_input {
                     agent.prompt.set_text("");
@@ -1045,9 +1132,17 @@ pub(super) fn dispatch_send_prompt_submission(
         // Local-UI commands returned above and must keep the hook-block hold
         agent.credit_limit_stashed_prompt = None;
         agent.release_hook_block_hold();
+        let mut untaken = attach_prompt_state_to_last_queued(
+            agent,
+            submitted_images,
+            chip_elements,
+            &mut app.pending_image_notices,
+        );
+        crate::prompt_images::drain_and_cleanup(
+            crate::prompt_images::SessionPathPolicy::Preserve,
+            &mut untaken,
+        );
         if consume_input {
-            // Drain prompt images before clearing prompt state.
-            drain_prompt_state_to_last_queued(agent);
             agent.prompt.set_text("");
             agent.note_draft_consumed();
         }
@@ -1058,7 +1153,7 @@ pub(super) fn dispatch_send_prompt_submission(
         effects.extend(dispatch(Action::Quit, app));
         return effects;
     } else {
-        // ── Server-authoritative immediate send (plain prompt only) ──
+        // Server-authoritative immediate send (plain prompt only)
         // The agent appends it to its authoritative `pending_inputs` (turn starts never overlap) and drives the drain via `x.ai/queue/changed`
         // So the chips are cleared ONLY when the suggestion actually sends or enqueues
         agent.release_hook_block_hold();
@@ -1101,6 +1196,11 @@ pub(super) fn dispatch_send_prompt_submission(
             && parked_sendable_wait
             && !hold_behind_existing_queue
         {
+            let image_notice = if consume_input {
+                agent.unbound_image_placeholder_notice()
+            } else {
+                None
+            };
             let images = agent.prompt.drain_images();
             if consume_input {
                 agent.prompt.set_text("");
@@ -1108,7 +1208,12 @@ pub(super) fn dispatch_send_prompt_submission(
             }
             // A new prompt is taking over (same contract as the immediate-send branch below)
             agent.clear_follow_ups();
-            effects.extend(interject::dispatch_send_prompt_now(app, text, images));
+            effects.extend(interject::dispatch_send_prompt_now(
+                app,
+                text,
+                images,
+                image_notice,
+            ));
             return effects;
         }
 
@@ -1126,6 +1231,8 @@ pub(super) fn dispatch_send_prompt_submission(
             // Plain image-free sends set no send-now cancel expectation: shell queue state and cancelTrigger decide the outcome
 
             if consume_input {
+                app.pending_image_notices
+                    .extend(agent.unbound_image_placeholder_notice());
                 // Plain prompt: no images to drain
                 // Clear the textarea and record up-arrow history (same as the local path's history insert)
                 agent.prompt.set_text("");
@@ -1168,8 +1275,20 @@ pub(super) fn dispatch_send_prompt_submission(
             .enqueue_prompt_with_skill_tokens(text.clone(), skill_token_ranges);
         agent.credit_limit_stashed_prompt = None;
         if consume_input {
-            // Drain prompt images before clearing prompt state.
-            drain_prompt_state_to_last_queued(agent);
+            app.pending_image_notices
+                .extend(agent.unbound_image_placeholder_notice());
+            // Take the composer's chips and images before `set_text("")` clears them.
+            let (_, images, chip_elements) = agent.prompt.stash().into_submission();
+            let mut untaken = attach_prompt_state_to_last_queued(
+                agent,
+                images,
+                chip_elements,
+                &mut app.pending_image_notices,
+            );
+            crate::prompt_images::drain_and_cleanup(
+                crate::prompt_images::SessionPathPolicy::Preserve,
+                &mut untaken,
+            );
             agent.prompt.set_text("");
             agent.note_draft_consumed();
         }
@@ -1196,7 +1315,7 @@ pub(super) fn dispatch_send_prompt_submission(
         if consume_input && !recorded_as_command {
             agent.record_prompt_in_history(&text);
         }
-        maybe_drain_queue(agent)
+        maybe_drain_queue(agent, &mut app.pending_image_notices)
     };
     effects.extend(drain.effects);
     note_peek_page_flip(app, id, drain.page_flip_entry);
@@ -1220,6 +1339,9 @@ pub(super) fn dispatch_send_bash_command(app: &mut AppView, command: String) -> 
     let ActiveView::Agent(id) = app.active_view else {
         return vec![];
     };
+    if refuse_if_load_failed(app, id) {
+        return vec![];
+    }
     let leader_mode = app.leader_mode;
     let Some(agent) = app.agents.get_mut(&id) else {
         return vec![];
@@ -1233,7 +1355,7 @@ pub(super) fn dispatch_send_bash_command(app: &mut AppView, command: String) -> 
         crate::app::agent_view::PromptInputMode::Bash,
     ));
 
-    // ── Server-authoritative immediate send for bash while running ──
+    // Server-authoritative immediate send for bash while running
     // A bash command typed while a turn is RUNNING is sent to the agent immediately (it's already a `session/prompt` with bash meta)
     // It is echoed into the shared queue with `kind="bash"`
     let bash_immediate = immediate_server_send_eligible(agent, leader_mode);
@@ -1282,7 +1404,7 @@ pub(super) fn dispatch_send_bash_command(app: &mut AppView, command: String) -> 
     agent.prompt.set_text("");
     agent.note_draft_consumed();
 
-    let drain = maybe_drain_queue(agent);
+    let drain = maybe_drain_queue(agent, &mut app.pending_image_notices);
     note_peek_page_flip(app, id, drain.page_flip_entry);
     drain.effects
 }
@@ -1615,6 +1737,9 @@ pub(super) fn handle_prompt_response(
 
         let was_bash_turn = agent.bash_turn;
         finish_turn_view(agent, TurnEnd::Completed);
+        // Worker threads go idle holding this turn's freed pages, and jemalloc on macOS has no decay thread to return them.
+        // Here, not in `finish_turn_view`: that also runs on the animation tick, where purges must wait for the frame to draw.
+        crate::memory_release::release_retained_memory("turn-end");
 
         // In-turn reviews die with their ext method. A post-turn review is the waiting UI and stays.
         // Cancelled or failed turns do not open approve/build for an in-progress or rejected plan.
@@ -1774,7 +1899,7 @@ pub(super) fn handle_prompt_response(
             None
         };
 
-        let drain = maybe_drain_queue(agent);
+        let drain = maybe_drain_queue(agent, &mut app.pending_image_notices);
         let page_flip_entry = adopted_page_flip.or(drain.page_flip_entry);
         let mut effects = drain.effects;
 
@@ -1810,6 +1935,57 @@ pub(super) fn handle_prompt_response(
         return effects;
     }
     vec![]
+}
+
+/// `/flush` or `/dream` finished: close the command state and post its outcome line.
+pub(super) fn handle_memory_command_complete(
+    app: &mut AppView,
+    agent_id: AgentId,
+    kind: MemoryCommandKind,
+    result: Result<(String, bool), String>,
+) -> Vec<Effect> {
+    let Some(agent) = app.agents.get_mut(&agent_id) else {
+        return vec![];
+    };
+    let command = match kind {
+        MemoryCommandKind::Flush => AgentCommand::MemoryFlush,
+        MemoryCommandKind::Dream => AgentCommand::MemoryDream,
+    };
+    if agent.session.state.command_in_flight() != Some(&command) {
+        tracing::debug!(
+            ?command,
+            "Ignoring memory command result (not in its command state)"
+        );
+        return vec![];
+    }
+    let elapsed = agent.turn_elapsed().unwrap_or_default();
+    agent.session.finish_command();
+
+    let (summary, succeeded) = match result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            tracing::error!(agent = ?agent_id, ?command, %error, "Memory command failed");
+            (error, false)
+        }
+    };
+    agent.scrollback.push_block(RenderBlock::session_event(
+        SessionEvent::MemoryCommandCompleted {
+            summary,
+            succeeded,
+            elapsed,
+        },
+    ));
+
+    agent.mark_turn_finished(TurnEnd::Completed);
+    agent.activity_started_at = None;
+    agent.last_activity = None;
+
+    if app.reconnect_pending {
+        return vec![];
+    }
+    let drain = maybe_drain_queue(agent, &mut app.pending_image_notices);
+    note_peek_page_flip(app, agent_id, drain.page_flip_entry);
+    drain.effects
 }
 
 pub(super) fn handle_compact_complete(
@@ -1873,7 +2049,7 @@ pub(super) fn handle_compact_complete(
         if app.reconnect_pending {
             return vec![];
         }
-        let drain = maybe_drain_queue(agent);
+        let drain = maybe_drain_queue(agent, &mut app.pending_image_notices);
         note_peek_page_flip(app, agent_id, drain.page_flip_entry);
         return drain.effects;
     }

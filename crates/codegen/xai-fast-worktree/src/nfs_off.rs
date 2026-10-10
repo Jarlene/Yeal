@@ -7,14 +7,12 @@ use anyhow::Result;
 
 pub(crate) use crate::grove_api::is_safe_worktree_id;
 pub use crate::grove_api::{
-    CAP_CANCEL_WORKTREE_CREATE, CleanArtifactsReply, DetachReply, GroveHardFail, NfsAdopted,
-    NfsCreateDecision, NfsStatusView, NfsWorktreeOpts, SalvageReply, daemon_capability_class,
-    grove_hard_fail,
+    CAP_CANCEL_WORKTREE_CREATE, CAP_FORK_FROM_BACKING, CleanArtifactsReply, DetachReply,
+    GroveHardFail, NfsAdopted, NfsCreateDecision, NfsStatusView, NfsWorktreeOpts, SalvageReply,
+    daemon_capability_class, grove_hard_fail,
 };
 #[allow(unused_imports)] // re-exported for discovery / execute when those modules are on
 pub(crate) use crate::grove_api::{default_grove_creation_mode, nfs_error_blocks_fallback};
-
-pub(crate) use crate::worktree::GroveTry;
 
 pub const WORKTREE_BACKING_DIR: &str = "worktree-backing";
 
@@ -94,13 +92,11 @@ pub fn source_is_linked_local_view(_opts: &NfsWorktreeOpts, _source: &Path) -> b
     false
 }
 
-pub fn try_nfs_remove(_worktree_path: &Path) -> Result<Option<crate::RemoveReport>> {
-    Ok(None)
+pub fn source_keeps_grove_create(_opts: &NfsWorktreeOpts, _source: &Path) -> bool {
+    false
 }
 
-pub(crate) fn try_grove_worktree(
-    _plan: &crate::worktree::plan::WorktreePlan,
-) -> Result<Option<GroveTry>> {
+pub fn try_nfs_remove(_worktree_path: &Path) -> Result<Option<crate::RemoveReport>> {
     Ok(None)
 }
 
@@ -120,6 +116,15 @@ pub fn dest_is_mountpoint(_path: &Path) -> bool {
 }
 
 pub fn dest_is_projected_mount(_path: &Path) -> bool {
+    false
+}
+
+pub fn dest_is_grove_projection(_path: &Path) -> bool {
+    false
+}
+
+#[must_use]
+pub fn source_is_grove_parent(_path: &Path) -> bool {
     false
 }
 

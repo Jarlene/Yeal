@@ -181,10 +181,11 @@ pub(crate) mod hydrate {
             generated_title,
             title_is_manual,
             worktree_label: None,
-            agent_name: None,
+            agent: Default::default(),
             // Hydrated locally: record the profile this process runs under
             sandbox_profile: xai_grok_sandbox::configured_profile_name().map(String::from),
             reasoning_effort: None,
+            context_window: None,
             last_turn_summary: None,
             last_turn_summary_prompt_id: None,
             last_recap: None,

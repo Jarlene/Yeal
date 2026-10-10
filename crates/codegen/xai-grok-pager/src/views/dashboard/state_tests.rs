@@ -105,44 +105,15 @@ fn persisted_row_id_round_trip_top_level() {
 }
 
 #[test]
-fn persisted_row_id_round_trip_subagent() {
-    let id = PersistedRowId::Subagent {
-        parent_session_id: "p-1".into(),
-        child_session_id: "c-1".into(),
-    };
-    let key = id.to_key();
-    assert_eq!(key, "sub:p-1:c-1");
-    assert_eq!(PersistedRowId::from_key(&key), Some(id));
-}
-
-#[test]
-fn persisted_row_id_subagent_with_colon_in_child_id() {
-    // The child session id portion may itself contain colons; we
-    // only split on the first colon after `sub:<parent>:`.
-    let raw = "sub:parent-x:abc:def:ghi";
-    let parsed = PersistedRowId::from_key(raw).unwrap();
-    match parsed {
-        PersistedRowId::Subagent {
-            parent_session_id,
-            child_session_id,
-        } => {
-            assert_eq!(parent_session_id, "parent-x");
-            assert_eq!(child_session_id, "abc:def:ghi");
-        }
-        _ => panic!("expected subagent variant"),
-    }
-}
-
-#[test]
 fn persisted_row_id_invalid() {
     assert!(PersistedRowId::from_key("garbage").is_none());
     // top:<empty> rejected.
     assert!(PersistedRowId::from_key("top:").is_none());
-    // sub: with no parent rejected.
+    // Stale subagent-row keys are ignored, including ones that used to parse.
+    assert!(PersistedRowId::from_key("sub:p-1:c-1").is_none());
+    assert!(PersistedRowId::from_key("sub:parent-x:abc:def:ghi").is_none());
     assert!(PersistedRowId::from_key("sub::child").is_none());
-    // sub:<parent> with no child rejected.
     assert!(PersistedRowId::from_key("sub:parent:").is_none());
-    // sub: with no colon between parent/child rejected.
     assert!(PersistedRowId::from_key("sub:foo").is_none());
 }
 
@@ -309,6 +280,7 @@ fn reanchor_selection_keeps_existing_id() {
     state.selected = Some(id1.clone());
     let rows = vec![super::super::row::DashboardRow {
         id: id1.clone(),
+        session_id: None,
         label: "r1".to_string(),
         subtitle: None,
         state: RowState::Idle,
@@ -320,10 +292,6 @@ fn reanchor_selection_keeps_existing_id() {
         pinned: false,
         badges: Vec::new(),
         context_pct: None,
-        indent: 0,
-        parent_label: None,
-        is_more_placeholder: false,
-        more_count: 0,
     }];
     state.reanchor_selection(&rows);
     assert_eq!(state.selected, Some(id1));
@@ -338,6 +306,7 @@ fn reanchor_selection_drops_to_none_when_previous_disappeared() {
     let id1 = DashboardRowId::TopLevel(AgentId(1));
     let rows = vec![super::super::row::DashboardRow {
         id: id1.clone(),
+        session_id: None,
         label: "r1".to_string(),
         subtitle: None,
         state: RowState::Idle,
@@ -349,10 +318,6 @@ fn reanchor_selection_drops_to_none_when_previous_disappeared() {
         pinned: false,
         badges: Vec::new(),
         context_pct: None,
-        indent: 0,
-        parent_label: None,
-        is_more_placeholder: false,
-        more_count: 0,
     }];
     state.reanchor_selection(&rows);
     assert_eq!(
@@ -373,9 +338,8 @@ fn persisted_on_disk_round_trip() {
     pinned.insert(PersistedRowId::TopLevel {
         session_id: "sess-3".into(),
     });
-    let reorder = vec![PersistedRowId::Subagent {
-        parent_session_id: "sess-3".into(),
-        child_session_id: "child-1".into(),
+    let reorder = vec![PersistedRowId::TopLevel {
+        session_id: "sess-9".into(),
     }];
     let p = PersistedDashboard {
         enabled: false,
@@ -389,6 +353,35 @@ fn persisted_on_disk_round_trip() {
     assert_eq!(loaded.grouping, Grouping::Directory);
     assert_eq!(loaded.pinned, pinned);
     assert_eq!(loaded.reorder, reorder);
+}
+
+/// A config written when the dashboard still pinned subagent rows must load. The `sub:` keys are
+/// dropped; the sibling `top:` keys and the rest of the table stay.
+#[test]
+fn load_persisted_drops_stale_subagent_row_ids() {
+    use std::collections::BTreeSet;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "\
+[dashboard]
+enabled = true
+grouping = \"state\"
+pinned = [\"top:sess-keep\", \"sub:parent:child\"]
+reorder = [\"sub:parent:child:with:colons\", \"top:sess-keep\"]
+",
+    )
+    .unwrap();
+    let loaded =
+        load_persisted_from_path(&path).expect("stale subagent ids must not fail the load");
+    let keep = PersistedRowId::TopLevel {
+        session_id: "sess-keep".into(),
+    };
+    assert!(loaded.enabled);
+    assert_eq!(loaded.grouping, Grouping::State);
+    assert_eq!(loaded.pinned, BTreeSet::from([keep.clone()]));
+    assert_eq!(loaded.reorder, vec![keep]);
 }
 
 /// The onboarding hint was removed — a stale `[dashboard.onboarding]`
@@ -811,10 +804,6 @@ fn ctrl_w_emits_toggle_worktree_action() {
         "Ctrl+W must resolve to the DashboardToggleWorktree action",
     );
 }
-
-// ---------------------------------------------------------------
-// handle_key tests (Esc cascade, Enter routing).
-// ---------------------------------------------------------------
 
 fn make_state_with_selection() -> DashboardState {
     let mut s = DashboardState::new();
@@ -2592,6 +2581,23 @@ fn alt_and_shift_enter_insert_newline_not_dispatch() {
     }
 }
 
+/// Delivered SUPER+Enter (Kitty) misses is_mod_enter and bare-Enter send; dashboard
+/// compose must insert a newline rather than dispatch (agent-prompt parity).
+#[test]
+fn delivered_super_enter_inserts_newline_not_dispatch() {
+    let reg = crate::actions::ActionRegistry::defaults();
+    let mut state = make_state_with_selection();
+    for ch in "hi".chars() {
+        let _ = state.handle_key(&KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &reg);
+    }
+    let outcome = state.handle_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::SUPER), &reg);
+    assert!(
+        !matches!(outcome, InputOutcome::Action(_)),
+        "SUPER+Enter must not dispatch, got {outcome:?}"
+    );
+    assert_eq!(state.dispatch.text(), "hi\n");
+}
+
 #[test]
 fn compose_enter_is_newline_matrix() {
     // Strict swap: (multiline, mod_enter) → is_newline
@@ -3440,7 +3446,7 @@ fn dispatch_bracketed_image_paste_defers_probe() {
     );
 }
 
-/// Regression: an IME commit delivered as bracketed paste (Otty)
+/// Regression: a bracketed paste whose text is not the clipboard text
 /// must not attach the unrelated clipboard image.
 #[test]
 fn dispatch_bracketed_paste_stamps_ctx_bracketed() {
@@ -4913,6 +4919,112 @@ fn ctrl_x_key_repeat_is_ignored() {
     ));
 }
 
+/// An empty Enter within a second of a send is an echo of that send (key auto-repeat, a bouncing key switch, a double tap).
+/// It must not click `+ New Agent` or open the selected row.
+#[test]
+fn empty_enter_right_after_send_is_swallowed() {
+    let mut state = DashboardState::new();
+    let reg = crate::actions::ActionRegistry::defaults();
+    let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    state.focus_new_agent_button();
+    state.list_focused = false;
+    state.dispatch.set_text("fix the bug");
+    assert!(matches!(
+        state.handle_input(&enter, &reg),
+        InputOutcome::Action(Action::DashboardDispatch { .. })
+    ));
+    // The dispatcher clears the input after creating the session
+    state.dispatch.set_text("");
+
+    assert!(
+        matches!(state.handle_input(&enter, &reg), InputOutcome::Unchanged),
+        "echoed Enter must not create an empty session"
+    );
+    // The window stays open while Enter keeps repeating
+    assert!(matches!(
+        state.handle_input(&enter, &reg),
+        InputOutcome::Unchanged
+    ));
+
+    // The same window swallows Enter on the selected row
+    state.focus_row(DashboardRowId::TopLevel(AgentId(0)));
+    state.list_focused = true;
+    assert!(matches!(
+        state.handle_input(&enter, &reg),
+        InputOutcome::Unchanged
+    ));
+
+    // `AppView` clears `last_send_at` on any key other than Enter
+    state.last_send_at = None;
+    assert!(matches!(
+        state.handle_input(&enter, &reg),
+        InputOutcome::Action(Action::DashboardAttach(_))
+    ));
+
+    // A draft typed inside the window still sends
+    state.focus_new_agent_button();
+    state.list_focused = false;
+    state.dispatch.set_text("again");
+    state.last_send_at = Some(Instant::now());
+    assert!(matches!(
+        state.handle_input(&enter, &reg),
+        InputOutcome::Action(Action::DashboardDispatch { .. })
+    ));
+}
+
+#[test]
+fn send_echo_window_is_one_second() {
+    use std::time::Duration;
+    assert!(send_echo_window_open(Duration::from_millis(900)));
+    assert!(!send_echo_window_open(Duration::from_millis(1000)));
+}
+
+fn enter_on_empty_input_right_after_send(
+    state: &mut DashboardState,
+    reg: &crate::actions::ActionRegistry,
+    multiline: bool,
+    modifiers: KeyModifiers,
+) -> InputOutcome {
+    state.multiline_mode = multiline;
+    state.dispatch.set_text("");
+    state.last_send_at = Some(Instant::now());
+    state.handle_input(&Event::Key(KeyEvent::new(KeyCode::Enter, modifiers)), reg)
+}
+
+/// Shift+Enter, Alt+Enter, and bare Enter in multiline mode insert a newline.
+/// They still do so on the empty input right after a send.
+#[test]
+fn newline_enter_right_after_send_still_inserts_newline() {
+    let mut state = DashboardState::new();
+    let reg = crate::actions::ActionRegistry::defaults();
+    state.focus_new_agent_button();
+    state.list_focused = false;
+
+    for (multiline, modifiers) in [
+        (false, KeyModifiers::SHIFT),
+        (false, KeyModifiers::ALT),
+        (true, KeyModifiers::NONE),
+    ] {
+        let outcome = enter_on_empty_input_right_after_send(&mut state, &reg, multiline, modifiers);
+        assert!(
+            matches!(outcome, InputOutcome::Changed),
+            "multiline={multiline} {modifiers:?}: expected a newline edit, got {outcome:?}"
+        );
+        assert_eq!(
+            state.dispatch.text(),
+            "\n",
+            "multiline={multiline} {modifiers:?}: the input must contain the newline"
+        );
+    }
+
+    // In multiline mode Shift+Enter is the send chord
+    assert!(matches!(
+        enter_on_empty_input_right_after_send(&mut state, &reg, true, KeyModifiers::SHIFT),
+        InputOutcome::Unchanged
+    ));
+}
+
 /// Cmd+X is SUPER, not CONTROL. DashboardStop is bound to Ctrl+X only,
 /// so a KKP Cmd+X must never arm/stop/delete — even with a highlight in
 /// the dispatch box or peek reply (wack setups / Ghostty).
@@ -5298,6 +5410,7 @@ fn section_vim_hl_collapse_expand() {
 fn reanchor_test_row(id: usize, state: RowState) -> super::super::row::DashboardRow {
     super::super::row::DashboardRow {
         id: DashboardRowId::TopLevel(AgentId(id)),
+        session_id: None,
         label: format!("r{id}"),
         subtitle: None,
         state,
@@ -5309,10 +5422,6 @@ fn reanchor_test_row(id: usize, state: RowState) -> super::super::row::Dashboard
         pinned: false,
         badges: Vec::new(),
         context_pct: None,
-        indent: 0,
-        parent_label: None,
-        is_more_placeholder: false,
-        more_count: 0,
     }
 }
 
@@ -5407,31 +5516,6 @@ fn reanchor_moves_collapse_hidden_pinned_row_to_pinned_header() {
         state.selected_section,
         Some(SectionKey::Pinned),
         "a collapse-hidden pinned row must re-anchor to the Pinned header",
-    );
-}
-
-/// A subagent row hidden by its PARENT's collapsed section
-/// re-anchors to the parent's state header (subagents render under
-/// the parent's group).
-#[test]
-fn reanchor_moves_collapse_hidden_subagent_to_parent_header() {
-    let mut state = DashboardState::new();
-    state.set_section_collapsed(SectionKey::State(RowState::Working), true);
-    let child_id = DashboardRowId::Subagent {
-        parent: AgentId(1),
-        child_session_id: "child-1".into(),
-    };
-    state.focus_row(child_id.clone());
-    let parent = reanchor_test_row(1, RowState::Working);
-    let mut child = reanchor_test_row(2, RowState::Working);
-    child.id = child_id;
-    child.indent = 1;
-    state.reanchor_selection(&[parent, child]);
-    assert!(state.selected.is_none());
-    assert_eq!(
-        state.selected_section,
-        Some(SectionKey::State(RowState::Working)),
-        "a hidden subagent must re-anchor to its parent's header",
     );
 }
 
@@ -5623,10 +5707,6 @@ fn clamp_viewport_handles_zero_viewport_height() {
     assert_eq!(s.viewport_offset, 5);
 }
 
-// -----------------------------------------------------------------
-// Mouse wheel decoupled from selection
-// -----------------------------------------------------------------
-
 /// `handle_scroll` flags `manual_scroll_active` so the next
 /// `clamp_viewport` knows to skip the snap-to-selection
 /// pull-back.
@@ -5732,8 +5812,6 @@ fn env_var_force_disables() {
     assert!(!super::super::dashboard_enabled());
     unsafe { std::env::remove_var("GROK_AGENT_DASHBOARD") };
 }
-
-// ── Location picker ─────────────────────────────────────────────
 
 fn location_candidate(path: &str, label: &str) -> LocationCandidate {
     LocationCandidate {
@@ -6724,68 +6802,6 @@ fn restore_ignores_page_flip_entry_removed_during_lease() {
 }
 
 #[test]
-fn note_page_flip_ignores_subagent_lease_on_parent_agent() {
-    let (id, mut agents) = lease_fixture_agent();
-    let child = crate::test_util::make_agent_view(Some("child"), "/tmp");
-    agents
-        .get_mut(&id)
-        .unwrap()
-        .insert_test_child("child".into(), Box::new(child));
-    let mut dash = DashboardState::new();
-    dash.begin_peek_viewport(
-        DashboardRowId::Subagent {
-            parent: id,
-            child_session_id: "child".into(),
-        },
-        &mut agents,
-    );
-    let entry_id = agent(&agents, id).scrollback.entry(3).unwrap().id;
-    dash.note_page_flip_for_lease(id, entry_id, &agents);
-    assert!(
-        dash.peek_viewport
-            .as_ref()
-            .unwrap()
-            .page_flip_entry
-            .is_none(),
-        "parent drain must not write parent entries onto a subagent lease"
-    );
-    agents
-        .get_mut(&id)
-        .unwrap()
-        .scrollback
-        .enable_follow_with_preserve();
-    dash.note_page_flip_for_lease(id, entry_id, &agents);
-    assert!(
-        dash.peek_viewport
-            .as_ref()
-            .unwrap()
-            .page_flip_entry
-            .is_none()
-    );
-}
-
-#[test]
-fn prepare_agent_unbind_restores_subagent_peek_lease() {
-    let (parent, mut agents) = lease_fixture_agent();
-    let child = crate::test_util::make_agent_view(Some("child"), "/tmp");
-    agents
-        .get_mut(&parent)
-        .unwrap()
-        .insert_test_child("child".into(), Box::new(child));
-    let row = DashboardRowId::Subagent {
-        parent,
-        child_session_id: "child".into(),
-    };
-    let mut dashboard = DashboardState::new();
-    dashboard.begin_peek_viewport(row, &mut agents);
-    assert!(dashboard.peek_viewport.is_some());
-
-    dashboard.prepare_agent_unbind(&std::collections::HashSet::from([parent]), &mut agents);
-
-    assert!(dashboard.peek_viewport.is_none());
-}
-
-#[test]
 fn refresh_repair_uses_old_identity_order_not_new_indexes() {
     let a = DashboardRowId::Workspace {
         session_id: "a".into(),
@@ -6954,4 +6970,24 @@ fn workspace_identity_keeps_removed_selection_as_repair_anchor() {
     dashboard.rebind_workspace_identities(&old, &new, &mut indexmap::IndexMap::new());
 
     assert_eq!(dashboard.selected, Some(old_row));
+}
+
+/// A subdivision flag keeps its tags; loose tags and tag text hidden after a flag are dropped
+#[test]
+fn rename_keeps_flag_tags_and_drops_loose_ones() {
+    let scotland = "\u{1f3f4}\u{e0067}\u{e0062}\u{e0073}\u{e0063}\u{e0074}\u{e007f}";
+    let hidden_after_flag =
+        "\u{1f3f4}\u{e0069}\u{e0067}\u{e006e}\u{e0020}\u{e0061}\u{e006c}\u{e006c}";
+    let mut draft = RenameDraft::new(DashboardRowId::TopLevel(AgentId(0)), "");
+
+    let pasted = format!("go {scotland} team\u{e0068}\u{e0069} {hidden_after_flag}");
+    handle_rename_paste(&mut draft, &pasted);
+
+    assert_eq!(format!("go {scotland} team \u{1f3f4}"), draft.text());
+
+    // A cap that cuts the flag leaves the black flag without its partial tags
+    let near_cap = "a".repeat(MAX_RENAME_SCALARS - 3);
+    let mut full = RenameDraft::new(DashboardRowId::TopLevel(AgentId(0)), "");
+    handle_rename_paste(&mut full, &format!("{near_cap}{scotland}"));
+    assert_eq!(format!("{near_cap}\u{1f3f4}"), full.text());
 }

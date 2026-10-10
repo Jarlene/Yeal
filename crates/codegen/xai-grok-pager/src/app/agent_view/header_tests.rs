@@ -4,7 +4,6 @@ use super::{AgentView, AppRenderParams, BannerSlotParams, OverlayHeader, test_fi
 use crate::actions::ActionRegistry;
 use crate::app::actions::Action;
 use crate::app::app_view::InputOutcome;
-use crate::app::bundle::BundleState;
 use crate::scrollback::render::ScratchBuffer;
 use crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::buffer::Buffer;
@@ -27,7 +26,6 @@ fn draw(
 ) -> Buffer {
     let (width, height) = agent.last_terminal_size;
     let area = Rect::new(0, 0, width, height);
-    let bundle = BundleState::default();
     let mut buf = Buffer::empty(area);
     let mut scratch = ScratchBuffer::new();
     agent.draw(
@@ -38,7 +36,6 @@ fn draw(
         None,
         false,
         BannerSlotParams::none(),
-        &bundle,
         in_overlay,
         &mut Vec::new(),
         AppRenderParams {
@@ -121,10 +118,6 @@ fn session_header_always_shortens_deep_cwd() {
     assert!(
         !row.contains("/deep/alpha"),
         "middle components must not stay full, row = {row:?}"
-    );
-    assert!(
-        !row.contains("(worktree of"),
-        "no leftover main-repo suffix, row = {row:?}"
     );
 }
 /// Frame 5: a plain session shows `path … [Dashboard]` on one row with no title and no switcher, the path in `text_secondary`.

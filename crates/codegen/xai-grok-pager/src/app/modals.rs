@@ -18,14 +18,12 @@ use crate::theme::Theme;
 use crate::views::modal::{self, ActiveModal};
 
 impl AgentView {
-    /// `suggest_args` falls back to model rows when the query is not in effort phase.
-    /// Model-phase reasoning rows use a trailing space in `insert_text`; effort rows do not.
-    /// Require a non-empty list with no trailing-space rows before treating the picker as effort phase.
-    fn arg_items_look_like_effort_phase(items: &[crate::slash::command::ArgItem]) -> bool {
+    /// `suggest_args` falls back to model rows when `picked` is not a sub-phase; window and effort rows all extend it.
+    fn arg_items_extend_pick(items: &[crate::slash::command::ArgItem], picked: &str) -> bool {
         !items.is_empty()
-            && items
-                .iter()
-                .all(|item| !item.insert_text.ends_with(char::is_whitespace))
+            && items.iter().all(|item| {
+                item.insert_text.len() > picked.len() && item.insert_text.starts_with(picked)
+            })
     }
 
     /// Step the model ArgPicker from effort phase back to the model list.
@@ -367,11 +365,12 @@ impl AgentView {
 
         // MemoryBrowser: route through ModalWindow chrome, then delegate.
         if let ActiveModal::MemoryBrowser { state } = modal {
-            // When the filter input is focused, Esc exits filter mode instead of closing the modal
-            // Handle before modal chrome
+            // While the filter or the preview has focus, Esc leaves that mode instead of closing
+            // the modal. Handle before modal chrome
             if matches!(
                 state.mode,
                 crate::views::memory_modal::MemoryModalMode::FilterFocused
+                    | crate::views::memory_modal::MemoryModalMode::PreviewFocused
             ) {
                 return crate::views::memory_modal::handle_memory_key(state, key);
             }
@@ -389,11 +388,7 @@ impl AgentView {
                     return InputOutcome::Changed;
                 }
                 ModalWindowOutcome::Unhandled => {
-                    let outcome = crate::views::memory_modal::handle_memory_key(state, key);
-                    if state.take_close_request() {
-                        self.active_modal = None;
-                    }
-                    return outcome;
+                    return crate::views::memory_modal::handle_memory_key(state, key);
                 }
                 _ => return InputOutcome::Changed,
             }
@@ -659,8 +654,16 @@ impl AgentView {
                     if let Some(cmd) = self.prompt.slash_controller.registry().get(&command_clone) {
                         let ctx = self.prompt.slash_controller.app_ctx(&self.session.models);
                         if let Some(effort_items) = cmd.suggest_args(&ctx, &next_query)
-                            && Self::arg_items_look_like_effort_phase(&effort_items)
+                            && Self::arg_items_extend_pick(&effort_items, &next_query)
                         {
+                            let selected = cmd
+                                .preselected_arg(&ctx, &next_query)
+                                .and_then(|target| {
+                                    effort_items
+                                        .iter()
+                                        .position(|row| row.insert_text == target)
+                                })
+                                .unwrap_or(0);
                             if let Some(ActiveModal::ArgPicker {
                                 args_query,
                                 items,
@@ -675,6 +678,7 @@ impl AgentView {
                                 // Effort sub-step is part of the type-to-find /model picker
                                 // Open input-focused (cursor and type-to-filter), matching the rest of the flow
                                 *state = crate::views::picker::PickerState::input_active();
+                                state.selected = selected;
                             }
                             return InputOutcome::Changed;
                         }
@@ -1797,8 +1801,10 @@ impl AgentView {
             {
                 // Arg picker: ModalWindow chrome and picker content
                 let title = match command.as_str() {
-                    "model" | "m" if !args_query.is_empty() => "Pick reasoning effort",
-                    "model" | "m" => "Pick model",
+                    "model" | "m" => crate::slash::commands::model::picker_title(
+                        &self.session.models,
+                        args_query,
+                    ),
                     "theme" | "t" => "Pick theme",
                     _ => "Pick option",
                 };
@@ -2395,6 +2401,10 @@ impl AgentView {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "modals_tests.rs"]
+mod tests;
 
 #[cfg(test)]
 mod session_picker_delete_tests {

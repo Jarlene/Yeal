@@ -183,25 +183,7 @@ pub enum ListDirOutput {
     /// Generic / unclassified error
     Error(String),
 }
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct GrepLineMatch {
-    pub line_number: usize,
-    pub content: String,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct GrepFileMatch {
-    pub path: String,
-    pub matches: Vec<GrepLineMatch>,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct GrepSearchOutput {
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-    pub exit_code: i32,
-    pub match_count: usize,
-    #[serde(default)]
-    pub file_matches: Vec<GrepFileMatch>,
-}
+pub use xai_tool_types::{GrepFileMatch, GrepLineMatch, GrepSearchOutput};
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FileContent {
     /// content here is the model friendly output which will always be present since even
@@ -468,18 +450,7 @@ pub struct BackgroundTaskStarted {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct WebSearchOutput {
-    pub query: String,
-    pub content: String,
-    pub citations: Vec<String>,
-    pub allowed_domains: Option<Vec<String>>,
-    /// When set, `to_prompt_format()` returns this text directly instead of
-    /// wrapping `content` with the default header. Used by the compat adapter
-    /// to produce the exact `Title: / Content: / ---` schema.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub pre_formatted: Option<String>,
-}
+pub use xai_tool_types::WebSearchOutput;
 #[derive(Debug, Clone)]
 pub struct WebFetchSourceArtifact {
     /// Session artifact containing the complete converted response.
@@ -887,15 +858,6 @@ impl ToolOutput {
             }) => {
                 let ask = &tool_hints.ask_user;
                 let exit = &tool_hints.exit_plan;
-                let task_hint = if tool_hints.task.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        "\n     You can use the {} tool with subagent_type=\"explore\" to \
-                         parallelize codebase exploration without filling your context window.",
-                        tool_hints.task
-                    )
-                };
                 let plan_status = match plan_file_seed {
                     PlanFileSeedStatus::Empty => {
                         format!(
@@ -925,7 +887,7 @@ impl ToolOutput {
                     "{message}\n\n\
                      {plan_status}\n\n\
                      In plan mode, you should:\n\
-                     1. Thoroughly explore the codebase to understand existing patterns{task_hint}\n\
+                     1. Thoroughly explore the codebase to understand existing patterns\n\
                      2. Identify similar features, codebase architecture, and understand trade-offs\n\
                      3. Use {ask} if you need to clarify the approach\n\
                      4. Design a concrete implementation strategy\n\
@@ -1289,7 +1251,6 @@ impl xai_tool_runtime::ToolOutput for BashOutput {
         })
     }
 }
-impl xai_tool_runtime::ToolOutput for GrepSearchOutput {}
 impl xai_tool_runtime::ToolOutput for ReadFileOutput {}
 impl xai_tool_runtime::ToolOutput for ListDirOutput {}
 impl xai_tool_runtime::ToolOutput for SearchReplaceOutput {
@@ -1303,7 +1264,6 @@ impl xai_tool_runtime::ToolOutput for SearchReplaceOutput {
     }
 }
 impl xai_tool_runtime::ToolOutput for TodoWriteOutput {}
-impl xai_tool_runtime::ToolOutput for WebSearchOutput {}
 impl xai_tool_runtime::ToolOutput for WebFetchOutput {}
 impl xai_tool_runtime::ToolOutput for SkillOutput {}
 impl xai_tool_runtime::ToolOutput for ApplyPatchOutput {}
@@ -2248,8 +2208,8 @@ mod tests {
             "resume_from hint with correct ID"
         );
         assert!(
-            rendered.contains("subagent_type: explore"),
-            "subagent_type visible"
+            !rendered.contains("subagent_type"),
+            "completion text must not advertise subagent_type"
         );
         assert!(
             rendered.contains("<subagent_result>"),
@@ -2401,8 +2361,8 @@ mod tests {
             plan_file_seed: PlanFileSeedStatus::Empty,
         });
         let prompt = output.to_prompt_format();
-        assert!(prompt.contains("delegate-xyz"));
-        assert!(prompt.contains("subagent_type"));
+        assert!(!prompt.contains("delegate-xyz"));
+        assert!(!prompt.contains("subagent_type"));
     }
     #[test]
     fn enter_plan_mode_prompt_format_with_custom_tool_names() {

@@ -11,10 +11,16 @@ use crate::scripted::ScriptedResponse;
 
 /// The text of a reply cut short at the output token limit.
 pub const CUT_REPLY: &str = "MOCK-CUT-PART-ONE";
+/// The text a truncated reply streams before its body ends.
+pub(crate) const TRUNCATED_REPLY: &str = "MOCK-TRUNCATED-PART";
+pub(crate) const CONTENT_FILTER_REPLY: &str = "MOCK-CONTENT-FILTER";
 /// The text of a reply from a model caught looping.
 pub const LOOPING_REPLY: &str = "MOCK-LOOP MOCK-LOOP MOCK-LOOP MOCK-LOOP";
 /// The header a client sends to opt into the inference API's loop detector.
 pub const DOOM_LOOP_CHECK_HEADER: &str = "x-grok-doom-loop-check";
+/// A single SSE data frame whose payload is not valid JSON, so the client's stream decoder fails to
+/// deserialize a chunk and surfaces a serialization error.
+pub(crate) const MALFORMED_SSE_BODY: &str = "data: {grok-mock malformed chunk\n\n";
 /// The detector report a looping reply carries: the tightest tail repetition on the thinking channel.
 pub const DOOM_LOOP_TRIGGER: &str = "tail_repetition:2@thinking";
 
@@ -27,6 +33,7 @@ pub struct StatusFailure {
     pub(crate) count: usize,
     pub(crate) retry_after: Option<Duration>,
     pub(crate) body: Option<String>,
+    pub(crate) context_window: Option<u64>,
 }
 
 impl StatusFailure {
@@ -41,6 +48,7 @@ impl StatusFailure {
             count: 1,
             retry_after: None,
             body: None,
+            context_window: None,
         }
     }
 
@@ -60,6 +68,16 @@ impl StatusFailure {
         self
     }
 
+    /// Sent as `x-grok-context-window`, the header that reports the model's context window.
+    pub fn with_context_window(mut self, tokens: u64) -> Self {
+        self.context_window = Some(tokens);
+        self
+    }
+
+    pub fn scripted_responses(&self) -> impl Iterator<Item = ScriptedResponse> + '_ {
+        (0..self.count).map(|_| self.clone().into_scripted_response())
+    }
+
     pub(crate) fn into_scripted_response(self) -> ScriptedResponse {
         let mut response = match self.body {
             Some(body) => ScriptedResponse::text(self.status, body),
@@ -72,6 +90,11 @@ impl StatusFailure {
             response
                 .headers
                 .push(("retry-after".to_owned(), retry_after.as_secs().to_string()));
+        }
+        if let Some(tokens) = self.context_window {
+            response
+                .headers
+                .push(("x-grok-context-window".to_owned(), tokens.to_string()));
         }
         response
     }
@@ -138,12 +161,31 @@ pub(crate) enum Failure {
     Cut {
         count: usize,
     },
+    ContentFilter {
+        count: usize,
+    },
     /// The entry's first tool call again, or the looping reply.
     DoomLoop {
         count: usize,
     },
     /// The connection closed with no body.
     Dropped {
+        count: usize,
+    },
+    /// A body the client's stream decoder cannot parse.
+    MalformedBody {
+        count: usize,
+    },
+    /// The stream opened then never sent a chunk, so the client's inference idle timeout fired.
+    Hang {
+        count: usize,
+    },
+    /// A complete reply with no text and no tool calls.
+    Empty {
+        count: usize,
+    },
+    /// [`TRUNCATED_REPLY`] streamed, then the body ended with no finish reason or terminal event.
+    Truncated {
         count: usize,
     },
 }
@@ -153,9 +195,14 @@ impl Failure {
         match self {
             Failure::Status(failure) => failure.count,
             Failure::StreamError(stream_error) => stream_error.count,
-            Failure::Cut { count } | Failure::DoomLoop { count } | Failure::Dropped { count } => {
-                *count
-            }
+            Failure::Cut { count }
+            | Failure::ContentFilter { count }
+            | Failure::DoomLoop { count }
+            | Failure::Dropped { count }
+            | Failure::MalformedBody { count }
+            | Failure::Hang { count }
+            | Failure::Empty { count }
+            | Failure::Truncated { count } => *count,
         }
     }
 
@@ -164,8 +211,13 @@ impl Failure {
             Failure::Status(failure) => ObservedFailure::Status(failure.status),
             Failure::StreamError(_) => ObservedFailure::StreamError,
             Failure::Cut { .. } => ObservedFailure::Cut,
+            Failure::ContentFilter { .. } => ObservedFailure::ContentFiltered,
             Failure::DoomLoop { .. } => ObservedFailure::DoomLoop,
             Failure::Dropped { .. } => ObservedFailure::Dropped,
+            Failure::MalformedBody { .. } => ObservedFailure::Malformed,
+            Failure::Hang { .. } => ObservedFailure::Hung,
+            Failure::Empty { .. } => ObservedFailure::Empty,
+            Failure::Truncated { .. } => ObservedFailure::Truncated,
         }
     }
 }
@@ -181,8 +233,17 @@ pub enum ObservedFailure {
     Dropped,
     /// Answered short at the output token limit.
     Cut,
+    ContentFiltered,
     /// Accepted, then failed with an error event inside the stream.
     StreamError,
     /// Answered with the entry's first tool call again, or with the looping reply.
     DoomLoop,
+    /// Answered with a body the client's stream decoder cannot parse.
+    Malformed,
+    /// Opened the stream then never sent a chunk, so the client's idle timeout fired.
+    Hung,
+    /// Answered with a complete reply that has no text and no tool calls.
+    Empty,
+    /// Streamed part of a reply, then ended the body with no finish reason or terminal event.
+    Truncated,
 }

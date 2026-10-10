@@ -781,7 +781,7 @@ pub fn map_tool_result(ev: &events::ToolCallCompleted) -> Option<ExternalRecord>
         .attr(ExternalKey::Success, ev.outcome.ran_successfully())
         .attr(ExternalKey::HookRewrote, ev.hook_rewrote)
         .attr(ExternalKey::DurationMs, ev.duration_ms)
-        .attr(ExternalKey::Model, ev.model_id.as_str())
+        .attr(ExternalKey::Model, ev.external_model_id.as_str())
         .gated(
             ExternalKey::ToolName,
             Gate::ToolDetails,
@@ -790,7 +790,7 @@ pub fn map_tool_result(ev: &events::ToolCallCompleted) -> Option<ExternalRecord>
         .metric(MetricIncrement::ToolUsage {
             tool_name: sanitized.to_owned(),
             outcome,
-            model: ev.model_id.clone(),
+            model: ev.external_model_id.clone(),
         });
     rec = attach_mcp_names(rec, &ev.tool_name);
     if let Some(path) = ev.file_path.as_deref() {
@@ -1057,6 +1057,20 @@ pub fn map_agent_connect(ev: &events::AgentConnect) -> Option<ExternalRecord> {
         });
     }
     Some(rec)
+}
+
+/// `SessionCreateFailed` maps to the session-create timeout counter (no external log event).
+pub fn map_session_create_failed(ev: &events::SessionCreateFailed) -> Option<ExternalRecord> {
+    if ev.outcome != crate::startup::StartupOutcome::Timeout {
+        return None;
+    }
+    let stuck = ev
+        .stuck_phase
+        .clone()
+        .unwrap_or_else(|| "unknown".to_owned());
+    Some(
+        ExternalRecord::default().metric(MetricIncrement::SessionCreateTimeout { stuck_in: stuck }),
+    )
 }
 
 pub fn map_startup_sub_timers(ev: &events::StartupSubTimers) -> Option<ExternalRecord> {

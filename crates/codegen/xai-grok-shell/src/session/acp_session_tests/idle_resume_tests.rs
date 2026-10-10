@@ -121,8 +121,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
             });
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             let actor = SessionActor {
-                repo_status_prefetch:
-                    crate::session::repo_status_prefix::RepoStatusPrefetchState::default(),
+                vcs_root: None,
                 transient_retry_enabled: true,
                 transient_retries_prompt_total: std::cell::Cell::new(0),
                 transient_episode_start: std::cell::Cell::new(None),
@@ -187,24 +186,22 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 rewind_pending_prompt: std::sync::Mutex::new(None),
                 startup_hints: StartupHints::default(),
                 forked_tool_override: None,
-                compaction: crate::session::compaction_config::CompactionConfig {
-                    threshold_percent: std::cell::Cell::new(85),
-                    force_compact: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                    context_window_override: None,
-                    count: std::sync::atomic::AtomicU64::new(0),
-                    auto_compact_suppressed: std::sync::atomic::AtomicU8::new(0),
-                    previous_model: std::cell::Cell::new(None),
-                    compaction_mode: xai_chat_state::CompactionMode::Transcript,
-                    verbatim_input: true,
-                    tool_choice: crate::util::config::CompactionToolChoice::Auto,
-                    prefire: crate::session::compaction_config::PrefireState::default(),
-                    prefix_released: std::sync::atomic::AtomicBool::new(false),
-                    cancel: Default::default(),
-                },
+                compaction: test_compaction_config(85),
+                long_reasoning_reminder:
+                    crate::session::long_reasoning_reminder::LongReasoningReminder {
+                        enabled: false,
+                        tokens: crate::session::long_reasoning_reminder::DEFAULT_TOKENS,
+                        delay: crate::session::long_reasoning_reminder::DEFAULT_DELAY,
+                    },
+                long_reasoning_turn_state: Default::default(),
                 memory: crate::session::memory_state::SessionMemory {
                     configured_mode: None,
                     v2_config: Default::default(),
                     configured_storage: None,
+                    process_disabled: false,
+                    config_opt_out: false,
+                    v2_legacy_carryover: false,
+                    prompt_sync_pending: std::sync::atomic::AtomicBool::new(false),
                     flush_config: crate::config::MemoryFlushConfig::default(),
                     is_flushing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     capture_worker: std::cell::RefCell::new(None),
@@ -300,7 +297,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 ),
                 goal_classifier_in_flight: std::sync::atomic::AtomicBool::new(false),
                 managed_mcp_handle: Default::default(),
-                initial_client_mcp_servers: vec![],
+                initial_client_mcp_servers: Default::default(),
                 tool_metadata_snapshot: Arc::new(std::sync::Mutex::new(Default::default())),
                 mcp_announcements: Default::default(),
                 mcp_reminder_mode: McpReminderMode::Delta,
@@ -327,7 +324,6 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 turn_end_tx: Default::default(),
                 client_hooks: Default::default(),
                 hook_resolved_workspace_root: String::new(),
-                vcs_kind: xai_grok_workspace::session::git::VcsKind::Git,
                 hook_load_errors: std::cell::RefCell::new(Vec::new()),
                 plugin_registry: std::cell::RefCell::new(None),
                 plugin_registry_handle: None,

@@ -12,6 +12,7 @@ use ratatui::{
     backend::{Backend, ClearType},
     buffer::{Buffer, Cell},
     layout::{Position, Rect, Size},
+    style::{Color, Modifier},
 };
 use unicode_width::UnicodeWidthStr as _;
 
@@ -26,6 +27,16 @@ pub struct LinkSpan {
     pub url: Arc<str>,
     /// Source grouping key (markdown / overlay id), not the emitted OSC 8 `id=`.
     pub id: Option<u32>,
+}
+
+/// How the host terminal treats rows already on screen when its width shrinks.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum WidthShrink {
+    /// Rows are cut at the new width and the cursor keeps its row.
+    #[default]
+    Truncates,
+    /// Rows wider than the new width re-wrap onto extra rows. The cursor moves down with its cell.
+    Rewraps,
 }
 
 /// Resolved hyperlink target stored in a frame's link table; `link_ids` entries
@@ -156,6 +167,8 @@ where
     /// Last known position of the cursor. Used to find the new area when the viewport is inlined
     /// and the terminal resized.
     last_known_cursor_pos: Position,
+    /// Decides where an inline resize finds the previous viewport top relative to the cursor.
+    width_shrink: WidthShrink,
     /// Number of frames rendered up until current time.
     frame_count: usize,
     /// Per-cell hyperlink id layer (`0` = no link), one per entry in `buffers`
@@ -187,6 +200,60 @@ fn front_back<T>(pair: &[T; 2], current: usize) -> (&T, &T) {
 fn front_back_mut<T>(pair: &mut [T; 2], current: usize) -> (&mut T, &mut T) {
     let [a, b] = pair;
     if current == 0 { (a, b) } else { (b, a) }
+}
+
+#[cfg(not(feature = "scrolling-regions"))]
+fn next_row_has_glyphs(rows: &[(String, bool, bool)], i: usize) -> bool {
+    rows.get(i + 1).is_some_and(|(ansi, _, _)| !ansi.is_empty())
+}
+
+/// Xenl is pending only after a full-width wrap; a short joiner is a hard `\r\n`.
+#[cfg(not(feature = "scrolling-regions"))]
+fn xenl_pending(rows: &[(String, bool, bool)], i: usize) -> bool {
+    rows.get(i)
+        .is_some_and(|(_, fills_width, wraps)| *wraps && *fills_width)
+        && next_row_has_glyphs(rows, i)
+}
+
+/// The chunk's last row wraps onto `next` in the full list (chunk-local xenl cannot see it).
+#[cfg(not(feature = "scrolling-regions"))]
+fn chunk_continues_xenl(
+    chunk: &[(String, bool, bool)],
+    next: Option<&(String, bool, bool)>,
+) -> bool {
+    chunk
+        .last()
+        .is_some_and(|(_, fills_width, wraps)| *wraps && *fills_width)
+        && next.is_some_and(|(ansi, _, _)| !ansi.is_empty())
+}
+
+/// Do not end a mid-chunk on a xenl-pending wrap when `max_n` can absorb the
+/// continuation. A wrap chain ≥ `max_n` still ends pending; [`write_semantic_rows`]
+/// consumes xenl at the chunk end so the next CUP cannot insert a hard break.
+/// Scroll-to-fill in [`Terminal::insert_before_rows_no_scrolling_regions`] must
+/// still keep that consume off the last screen line.
+#[cfg(not(feature = "scrolling-regions"))]
+fn mid_chunk_end(row_idx: usize, rows: &[(String, bool, bool)], max_n: usize) -> usize {
+    if max_n == 0 || row_idx >= rows.len() {
+        return row_idx;
+    }
+    let pending = |end: usize| end.checked_sub(1).is_some_and(|i| xenl_pending(rows, i));
+    let mut end = row_idx.saturating_add(max_n).min(rows.len());
+    while end > row_idx + 1 && end < rows.len() && pending(end) {
+        end -= 1;
+    }
+    if end < rows.len() && pending(end) && end - row_idx < max_n {
+        end += 1;
+        while end < rows.len() && end - row_idx < max_n && pending(end) {
+            end += 1;
+        }
+    }
+    // max_n cannot absorb the continuation. One fewer painted row; scroll math
+    // still has to reserve the consume line or fill pins it on last_screen.
+    if end < rows.len() && pending(end) && end > row_idx + 1 && end - row_idx >= max_n {
+        end -= 1;
+    }
+    end
 }
 
 impl<B> Terminal<B>
@@ -228,6 +295,7 @@ where
             viewport_area,
             last_known_area: area,
             last_known_cursor_pos: cursor_pos,
+            width_shrink: WidthShrink::default(),
             frame_count: 0,
             link_ids: [vec![0; link_len], vec![0; link_len]],
             link_tables: [Vec::new(), Vec::new()],
@@ -378,14 +446,12 @@ where
             {
                 area
             }
-            Viewport::Inline(height) => {
-                let offset_in_previous_viewport = self
-                    .last_known_cursor_pos
-                    .y
-                    .saturating_sub(self.viewport_area.top());
+            Viewport::Inline(_) => {
+                let offset_in_previous_viewport = self.reflowed_cursor_offset(area.width);
+                // The stored `Inline` height lags `set_viewport_area`. A stale taller height makes the new area cover committed rows
                 compute_inline_size(
                     &mut self.backend,
-                    height,
+                    self.viewport_area.height,
                     area.as_size(),
                     offset_in_previous_viewport,
                 )?
@@ -588,6 +654,38 @@ where
         }
     }
 
+    /// Insert wrap-aware ANSI rows before the inline viewport.
+    ///
+    /// Mid-insert wrap rows omit `\r\n` so the terminal sets `WRAPLINE`.
+    /// A full-width hard break (fills, does not wrap) disables autowrap so xenl cannot join the next line.
+    pub fn insert_before_rows(&mut self, rows: &[(String, bool, bool)]) -> io::Result<()>
+    where
+        B: Write,
+    {
+        match self.viewport {
+            Viewport::Inline(_) => {
+                let height = u16::try_from(rows.len()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "insert_before_rows: row count exceeds u16",
+                    )
+                })?;
+                if height == 0 {
+                    return Ok(());
+                }
+                #[cfg(feature = "scrolling-regions")]
+                {
+                    // Pager builds without this feature; reserve space so the unused variant compiles.
+                    let _ = rows;
+                    self.insert_before(height, |_| {})
+                }
+                #[cfg(not(feature = "scrolling-regions"))]
+                self.insert_before_rows_no_scrolling_regions(rows, height)
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Sets the height of an inline viewport and resizes it accordingly. This method only works with inline viewports. For
     /// other viewport types, it has no effect. The viewport will be resized to the new height, and the buffers will be
     /// cleared and reallocated to match the new size.
@@ -701,6 +799,117 @@ where
         Ok(())
     }
 
+    /// Same scroll math as [`Self::insert_before_no_scrolling_regions`], with one row of slack so a streaming chunk cannot autowrap off the last screen line. Xenl consume at a mid-chunk end needs a second slack row: fill math would otherwise pin the pending wrap on `last_screen`.
+    #[cfg(not(feature = "scrolling-regions"))]
+    fn insert_before_rows_no_scrolling_regions(
+        &mut self,
+        rows: &[(String, bool, bool)],
+        height: u16,
+    ) -> io::Result<()>
+    where
+        B: Write,
+    {
+        let mut drawn_height: i32 = self.viewport_area.top().into();
+        let mut remaining: i32 = i32::from(height);
+        let viewport_height: i32 = self.viewport_area.height.into();
+        let screen_height: i32 = self.last_known_area.height.into();
+        let max_chunk = if screen_height > 1 {
+            screen_height - 1
+        } else {
+            screen_height
+        };
+        let mut row_idx = 0usize;
+        let max_n = usize::try_from(max_chunk).unwrap_or(0);
+
+        while remaining + viewport_height > screen_height {
+            let end = mid_chunk_end(row_idx, rows, max_n);
+            let n = end.saturating_sub(row_idx);
+            if n == 0 {
+                break;
+            }
+            let to_draw = i32::try_from(n).unwrap_or(0);
+            let chunk = rows.get(row_idx..end).unwrap_or(&[]);
+            let more_xenl = chunk_continues_xenl(chunk, rows.get(end));
+            // Fill would pin the last painted row on last_screen. Xenl consume
+            // wrapping from there extra-scrolls and native-copy-joins the dummy.
+            let consume_slack = if more_xenl && screen_height > 1 { 1 } else { 0 };
+            let scroll_up = 0.max(drawn_height + to_draw + consume_slack - screen_height);
+            self.scroll_up(scroll_up as u16)?;
+            let y = (drawn_height - scroll_up) as u16;
+            self.write_semantic_rows(y, chunk, more_xenl)?;
+            row_idx = end;
+            drawn_height += to_draw - scroll_up;
+            remaining -= to_draw;
+        }
+
+        let scroll_up = 0.max(drawn_height + remaining + viewport_height - screen_height);
+        self.scroll_up(scroll_up as u16)?;
+        let y = (drawn_height - scroll_up) as u16;
+        let chunk = rows.get(row_idx..).unwrap_or(&[]);
+        self.write_semantic_rows(y, chunk, false)?;
+        drawn_height += remaining - scroll_up;
+
+        self.set_viewport_area(Rect {
+            y: drawn_height as u16,
+            ..self.viewport_area
+        });
+        self.clear()?;
+        Ok(())
+    }
+
+    /// CUP once at the chunk start. Xenl-continue only on a full-width wrap onto a nonempty next row;
+    /// a short joiner hard-breaks, and a full-width hard break is DECAWM-off after any xenl consume.
+    /// `more_xenl` is the wrap-pending state of this chunk's last row in the full row list.
+    #[cfg(not(feature = "scrolling-regions"))]
+    fn write_semantic_rows(
+        &mut self,
+        y_offset: u16,
+        rows: &[(String, bool, bool)],
+        more_xenl: bool,
+    ) -> io::Result<()>
+    where
+        B: Write,
+    {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let last_screen = self.last_known_area.height.saturating_sub(1);
+        self.set_cursor_position(Position::new(0, y_offset))?;
+        let mut consume_xenl = false;
+        for (i, (ansi, fills_width, _)) in rows.iter().enumerate() {
+            let y = y_offset.saturating_add(u16::try_from(i).unwrap_or(u16::MAX));
+            let continues = xenl_pending(rows, i) || (more_xenl && i + 1 == rows.len());
+            let disable_autowrap = *fills_width && !continues;
+            if consume_xenl {
+                // Dummy printable first: CSI ?7l drops wrap-pending on VTE/xterm without WRAPLINE.
+                self.backend.write_all(b" \r")?;
+            }
+            if disable_autowrap {
+                self.backend.write_all(b"\x1b[?7l")?;
+            }
+            self.backend.write_all(ansi.as_bytes())?;
+            if !continues {
+                // Short/empty rows do not overwrite the rest of a longer live line.
+                if !*fills_width {
+                    self.backend.write_all(b"\x1b[K")?;
+                }
+                if y < last_screen {
+                    self.backend.write_all(b"\r\n")?;
+                }
+            }
+            if disable_autowrap {
+                self.backend.write_all(b"\x1b[?7h")?;
+            }
+            consume_xenl = continues;
+        }
+        if consume_xenl {
+            // Latch WRAPLINE before the next chunk CUPs; a wrap chain ≥ screen_height-1
+            // cannot keep the continuation in this chunk.
+            self.backend.write_all(b" \r")?;
+        }
+        Backend::flush(&mut self.backend)
+    }
+
     /// If a terminal supports scrolling regions, it means that we can define a subset of rows of the screen, and then tell
     /// the terminal to scroll up or down just within that region. The rows outside of the region are not affected. This
     /// function utilizes this feature to avoid having to redraw the viewport.
@@ -793,9 +1002,10 @@ where
             let iter = to_draw
                 .iter()
                 .enumerate()
+                .filter(|(_, c)| !c.skip)
                 .map(|(i, c)| ((i % width) as u16, y_offset + (i / width) as u16, c));
             self.backend.draw(iter)?;
-            self.backend.flush()?;
+            Backend::flush(&mut self.backend)?;
         }
         Ok(remainder)
     }
@@ -965,6 +1175,24 @@ fn emit_frame_with_links<B: Backend + Write>(
     Ok(())
 }
 
+/// Columns of row `y` a reflowing terminal keeps when re-wrapping. They run through the last glyph or visibly styled blank.
+fn row_extent(buf: &Buffer, y: u16) -> u16 {
+    let area = buf.area;
+    (area.left()..area.right())
+        .rev()
+        .find_map(|x| {
+            let cell = buf.cell((x, y))?;
+            let is_blank = cell.symbol().trim().is_empty()
+                && cell.bg == Color::Reset
+                && !cell
+                    .modifier
+                    .intersects(Modifier::REVERSED | Modifier::UNDERLINED);
+            let width = u16::try_from(cell.symbol().width()).unwrap_or(1).max(1);
+            (!is_blank).then(|| (x - area.left()).saturating_add(width))
+        })
+        .unwrap_or(0)
+}
+
 fn compute_inline_size<B: Backend>(
     backend: &mut B,
     height: u16,
@@ -1011,6 +1239,38 @@ impl<B: Backend> Terminal<B> {
     /// (e.g. the minimal-mode overlay host) should read it here for consistency.
     pub fn last_known_area(&self) -> Rect {
         self.last_known_area
+    }
+
+    /// Record a cursor move the caller queued straight to the backend, bypassing [`Self::set_cursor_position`].
+    /// An inline resize anchors the viewport on this position.
+    pub fn record_cursor_position(&mut self, position: Position) {
+        self.last_known_cursor_pos = position;
+    }
+
+    /// Set how the host terminal treats on-screen rows when its width shrinks.
+    pub fn set_width_shrink(&mut self, width_shrink: WidthShrink) {
+        self.width_shrink = width_shrink;
+    }
+
+    /// Rows from the viewport top to the cursor once the terminal has applied a resize to `new_width`.
+    /// Trailing blanks do not count. An estimate that errs low leaves a stale row above the redraw and never clears a committed row.
+    fn reflowed_cursor_offset(&self, new_width: u16) -> u16 {
+        let top = self.viewport_area.top();
+        let cursor = self.last_known_cursor_pos;
+        let rows_above = cursor.y.saturating_sub(top);
+        if self.width_shrink == WidthShrink::Truncates
+            || new_width == 0
+            || new_width >= self.viewport_area.width
+        {
+            return rows_above;
+        }
+        let last_frame = front_back(&self.buffers, self.current).1;
+        let spilled = (top..cursor.y)
+            .map(|y| row_extent(last_frame, y).saturating_sub(1) / new_width)
+            .fold(0, u16::saturating_add);
+        rows_above
+            .saturating_add(spilled)
+            .saturating_add(cursor.x / new_width)
     }
 
     /// Switch the viewport kind in place, keeping the backend alive. `Viewport::Inline` issues a cursor-position query
@@ -1063,10 +1323,12 @@ impl<B: Backend> Terminal<B> {
 
 #[cfg(test)]
 mod inline_resize_tests {
-    use ratatui::backend::TestBackend;
-    use ratatui::{TerminalOptions, Viewport, layout::Rect};
+    use ratatui::backend::{Backend, TestBackend};
+    use ratatui::layout::{Position, Rect};
+    use ratatui::style::Style;
+    use ratatui::{TerminalOptions, Viewport};
 
-    use super::Terminal;
+    use super::{Terminal, WidthShrink};
 
     fn full_height_inline(width: u16, height: u16) -> Terminal<TestBackend> {
         Terminal::with_options(
@@ -1186,6 +1448,143 @@ mod inline_resize_tests {
         // i.e. it keeps the standard `compute_inline_size` behavior and is not ballooned to full height.
         assert_eq!(terminal.viewport_area().height, 3);
         assert_eq!(terminal.viewport_area().width, 120);
+    }
+
+    /// A 4-row inline viewport at row 10 of an 80x24 screen whose last frame painted `rows` (absolute y, text).
+    fn painted_inline(rows: &[(u16, &str)]) -> Terminal<TestBackend> {
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(80, 24),
+            TerminalOptions {
+                viewport: Viewport::Inline(4),
+            },
+        )
+        .unwrap();
+        terminal.set_viewport_area(Rect::new(0, 10, 80, 4));
+        terminal.set_width_shrink(WidthShrink::Rewraps);
+        terminal
+            .draw(|f| {
+                for (y, text) in rows {
+                    f.buffer_mut().set_string(0, *y, text, Style::default());
+                }
+            })
+            .unwrap();
+        terminal
+    }
+
+    /// The pager moves the visible cursor after the cell diff. The resize anchors on that position, not on the last diffed cell.
+    #[test]
+    fn inline_resize_anchors_on_recorded_cursor_row() {
+        let mut terminal = painted_inline(&[(11, "status"), (12, "> draft"), (13, "info")]);
+        terminal.record_cursor_position(Position::new(7, 12));
+        terminal.backend_mut().resize(80, 20);
+        terminal
+            .backend_mut()
+            .set_cursor_position(Position::new(7, 12))
+            .unwrap();
+
+        terminal.autoresize().unwrap();
+
+        assert_eq!(Rect::new(0, 10, 80, 4), terminal.viewport_area());
+    }
+
+    /// A reflowing terminal splits a 70-column row onto two rows at 40 columns and moves the cursor down with it.
+    #[test]
+    fn inline_narrowing_counts_rows_rewrapped_above_cursor() {
+        let wide = "w".repeat(70);
+        let mut terminal = painted_inline(&[(10, &wide), (11, "status"), (12, "> draft")]);
+        terminal.record_cursor_position(Position::new(7, 12));
+        terminal.backend_mut().resize(40, 24);
+        terminal
+            .backend_mut()
+            .set_cursor_position(Position::new(7, 13))
+            .unwrap();
+
+        terminal.autoresize().unwrap();
+
+        assert_eq!(Rect::new(0, 10, 40, 4), terminal.viewport_area());
+    }
+
+    /// A cursor past the new width moves onto the re-wrapped part of its own row.
+    #[test]
+    fn inline_narrowing_counts_cursor_column_spill() {
+        let draft = format!("> {}", "d".repeat(50));
+        let mut terminal = painted_inline(&[(11, "status"), (12, &draft)]);
+        terminal.record_cursor_position(Position::new(52, 12));
+        terminal.backend_mut().resize(40, 24);
+        terminal
+            .backend_mut()
+            .set_cursor_position(Position::new(12, 13))
+            .unwrap();
+
+        terminal.autoresize().unwrap();
+
+        assert_eq!(Rect::new(0, 10, 40, 4), terminal.viewport_area());
+    }
+
+    /// `set_viewport_area` leaves the stored `Inline` height behind. A resize must size from the live viewport area.
+    #[test]
+    fn inline_resize_sizes_from_live_viewport_height() {
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(80, 26),
+            TerminalOptions {
+                viewport: Viewport::Inline(15),
+            },
+        )
+        .unwrap();
+        terminal.set_viewport_area(Rect::new(0, 23, 80, 3));
+        terminal.record_cursor_position(Position::new(2, 24));
+        terminal.backend_mut().resize(80, 34);
+        terminal
+            .backend_mut()
+            .set_cursor_position(Position::new(2, 32))
+            .unwrap();
+
+        terminal.autoresize().unwrap();
+
+        assert_eq!(Rect::new(0, 31, 80, 3), terminal.viewport_area());
+    }
+
+    /// On a truncating terminal, wide rows above the cursor do not shift the anchor.
+    #[test]
+    fn inline_narrowing_on_truncating_terminal_keeps_row_offset() {
+        let wide = "w".repeat(70);
+        let mut terminal = painted_inline(&[(10, &wide), (11, "status"), (12, "> draft")]);
+        terminal.set_width_shrink(WidthShrink::Truncates);
+        terminal.record_cursor_position(Position::new(7, 12));
+        terminal.backend_mut().resize(40, 24);
+        terminal
+            .backend_mut()
+            .set_cursor_position(Position::new(7, 12))
+            .unwrap();
+
+        terminal.autoresize().unwrap();
+
+        assert_eq!(Rect::new(0, 10, 40, 4), terminal.viewport_area());
+    }
+
+    /// Unwritten trailing cells do not re-wrap. A widening never splits rows.
+    #[test]
+    fn inline_resize_ignores_trailing_blanks_and_widening() {
+        let mut narrowed = painted_inline(&[(10, "short"), (11, "status"), (12, "> draft")]);
+        narrowed.record_cursor_position(Position::new(7, 12));
+        narrowed.backend_mut().resize(40, 24);
+        narrowed
+            .backend_mut()
+            .set_cursor_position(Position::new(7, 12))
+            .unwrap();
+        narrowed.autoresize().unwrap();
+        assert_eq!(Rect::new(0, 10, 40, 4), narrowed.viewport_area());
+
+        let wide = "w".repeat(70);
+        let mut widened = painted_inline(&[(10, &wide), (11, "status"), (12, "> draft")]);
+        widened.record_cursor_position(Position::new(7, 12));
+        widened.backend_mut().resize(120, 24);
+        widened
+            .backend_mut()
+            .set_cursor_position(Position::new(7, 12))
+            .unwrap();
+        widened.autoresize().unwrap();
+        assert_eq!(Rect::new(0, 10, 120, 4), widened.viewport_area());
     }
 
     /// Fullscreen viewports already track the full size; behavior is unchanged.

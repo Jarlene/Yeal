@@ -12,6 +12,16 @@ use crate::app::dispatch::session::lifecycle::dispatch_accept_consent;
 fn simulate_release_build() {
     unsafe { std::env::set_var(xai_grok_version::TEST_VERSION_ENV, "0.0.0-sim") };
 }
+fn pending_trust_workspace() -> (tempfile::TempDir, std::path::PathBuf, AppView) {
+    use xai_grok_workspace::trust::workspace_key;
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    let workspace = workspace_key(repo.path());
+    let mut app = test_app();
+    app.trust_state = TrustState::Pending {
+        workspace: workspace.clone(),
+    };
+    (repo, workspace, app)
+}
 #[test]
 fn voice_on_welcome_creates_session_and_records() {
     let mut app = test_app();
@@ -30,7 +40,7 @@ fn voice_on_welcome_creates_session_and_records() {
     assert_eq!(app.voice_recording_target(), Some(VoiceTarget::Agent(id)));
     assert!(matches!(
         rx.try_recv(),
-        Ok(xai_grok_voice::VoiceCommand::PttPress)
+        Ok(xai_grok_voice::VoiceCommand::PttPress { .. })
     ));
 }
 #[test]
@@ -44,7 +54,8 @@ fn voice_final_routes_to_recording_session_not_active_view() {
     app.active_view = ActiveView::Agent(other);
     app.voice_state = VoiceState::Stopping {
         target: VoiceTarget::Agent(rec),
-        interim: None,
+        partial: Partial::None,
+        route: None,
     };
     crate::voice::handle_voice_event(
         &mut app,
@@ -77,7 +88,8 @@ fn voice_auto_stops_when_leaving_recording_session() {
     app.voice_state = VoiceState::Recording {
         hold: false,
         target: VoiceTarget::Agent(id),
-        interim: None,
+        partial: Partial::None,
+        route: None,
     };
     app.active_view = ActiveView::Agent(id);
     app.enforce_voice_session_bound();
@@ -93,7 +105,7 @@ fn voice_auto_stops_when_leaving_recording_session() {
     );
     assert!(matches!(
         rx.try_recv(),
-        Ok(xai_grok_voice::VoiceCommand::PttRelease)
+        Ok(xai_grok_voice::VoiceCommand::Abort)
     ));
 }
 #[test]
@@ -506,6 +518,8 @@ fn worktree_session_failed_without_session_returns_to_welcome() {
         Action::TaskComplete(TaskResult::WorktreeSessionFailed {
             agent_id: id,
             error: error_msg.into(),
+            orphaned_worktree_root: None,
+            timed_out: false,
         }),
         &mut app,
     );
@@ -537,6 +551,8 @@ fn worktree_session_failed_with_fork_parent_keeps_agent() {
         Action::TaskComplete(TaskResult::WorktreeSessionFailed {
             agent_id: id,
             error: error_msg.into(),
+            orphaned_worktree_root: None,
+            timed_out: false,
         }),
         &mut app,
     );
@@ -714,6 +730,7 @@ fn session_failed_keeps_agent_clears_loading_and_toasts() {
         Action::TaskComplete(TaskResult::SessionFailed {
             agent_id: id,
             error: "No space left on device".to_string(),
+            timed_out: false,
         }),
         &mut app,
     );
@@ -725,6 +742,46 @@ fn session_failed_keeps_agent_clears_loading_and_toasts() {
         agent.toast.as_ref().map(|(m, _)| m.as_str()),
         Some("Session creation failed: No space left on device"),
     );
+}
+#[test]
+fn session_failed_names_step_only_on_timeout() {
+    for (timed_out, error, expected) in [
+        (
+            true,
+            "raw wire timeout text",
+            "Couldn't start the session: it timed out while loading your plugins. It may still \
+             finish in the background, so give it a moment before trying again.",
+        ),
+        (
+            false,
+            "No space left on device",
+            "Session creation failed: No space left on device",
+        ),
+    ] {
+        let mut app = test_app_with_agent();
+        let id = AgentId(0);
+        {
+            let a = app.agents.get_mut(&id).unwrap();
+            a.session.session_id = Some(acp::SessionId::new("existing"));
+            a.session_starting_since = Some(std::time::Instant::now());
+            a.session_new_phase = Some(xai_grok_shell::agent::SessionSetupPhase::PluginRegistry);
+        }
+        dispatch(
+            Action::TaskComplete(TaskResult::SessionFailed {
+                agent_id: id,
+                error: error.to_string(),
+                timed_out,
+            }),
+            &mut app,
+        );
+        assert_eq!(
+            Some(expected),
+            expect_agent(&app, id)
+                .toast
+                .as_ref()
+                .map(|(m, _)| m.as_str()),
+        );
+    }
 }
 #[test]
 fn session_failed_orphan_returns_to_welcome_with_warning() {
@@ -740,6 +797,7 @@ fn session_failed_orphan_returns_to_welcome_with_warning() {
         Action::TaskComplete(TaskResult::SessionFailed {
             agent_id: id,
             error: "No space left on device".to_string(),
+            timed_out: false,
         }),
         &mut app,
     );
@@ -766,6 +824,7 @@ fn session_failed_orphan_with_fallback_toasts() {
         Action::TaskComplete(TaskResult::SessionFailed {
             agent_id: fail_id,
             error: "No space left on device".to_string(),
+            timed_out: false,
         }),
         &mut app,
     );
@@ -794,6 +853,7 @@ fn session_failed_orphan_does_not_steal_other_active_agent() {
         Action::TaskComplete(TaskResult::SessionFailed {
             agent_id: fail_id,
             error: "No space left on device".to_string(),
+            timed_out: false,
         }),
         &mut app,
     );
@@ -822,6 +882,7 @@ fn session_failed_orphan_on_welcome_with_survivor_uses_startup_warning() {
         Action::TaskComplete(TaskResult::SessionFailed {
             agent_id: fail_id,
             error: "No space left on device".to_string(),
+            timed_out: false,
         }),
         &mut app,
     );
@@ -850,13 +911,7 @@ fn switch_model_without_session_sends_nothing_to_server() {
     let id = AgentId(0);
     app.agents.get_mut(&id).unwrap().session.session_id = None;
     let model_id = acp::ModelId::new(std::sync::Arc::from("grok-4.5"));
-    let effects = dispatch(
-        Action::SwitchModel {
-            model_id,
-            effort: None,
-        },
-        &mut app,
-    );
+    let effects = dispatch(Action::SwitchModel(ModelChoice::new(model_id)), &mut app);
     assert!(
         !effects
             .iter()
@@ -1087,10 +1142,7 @@ fn switch_model_deferred_when_no_session_id() {
     let model_id = acp::ModelId::new(std::sync::Arc::from("grok-4.5"));
     app.agents.get_mut(&id).unwrap().session.session_id = None;
     let effects = dispatch(
-        Action::SwitchModel {
-            model_id: model_id.clone(),
-            effort: None,
-        },
+        Action::SwitchModel(ModelChoice::new(model_id.clone())),
         &mut app,
     );
     assert!(
@@ -1124,10 +1176,7 @@ fn deferred_switch_threads_stash_prev_into_effect() {
     agent.session.session_id = None;
     agent.session.models.current = Some(model_a.clone());
     dispatch(
-        Action::SwitchModel {
-            model_id: model_b.clone(),
-            effort: None,
-        },
+        Action::SwitchModel(ModelChoice::new(model_b.clone())),
         &mut app,
     );
     let effects = dispatch(
@@ -1141,8 +1190,8 @@ fn deferred_switch_threads_stash_prev_into_effect() {
     );
     assert!(effects.iter().any(|e| matches!(
         e,
-        Effect::SwitchModel { model_id, prev_model_id, .. }
-            if *model_id == model_b && *prev_model_id == Some(model_a.clone())
+        Effect::SwitchModel { choice, prev_model_id, .. }
+            if choice.model_id == model_b && *prev_model_id == Some(model_a.clone())
     )));
 }
 #[test]
@@ -1170,8 +1219,8 @@ fn deferred_switch_prefers_authoritative_current_as_prev() {
     );
     assert!(effects.iter().any(|e| matches!(
         e,
-        Effect::SwitchModel { model_id, prev_model_id, .. }
-            if *model_id == model_b && *prev_model_id == Some(server_model.clone())
+        Effect::SwitchModel { choice, prev_model_id, .. }
+            if choice.model_id == model_b && *prev_model_id == Some(server_model.clone())
     )));
 }
 #[test]
@@ -1211,8 +1260,8 @@ fn deferred_model_switch_applied_on_session_created() {
         Effect::SwitchModel {
             agent_id: a_id,
             session_id: s_id,
-            model_id: m_id,
-            .. } if *a_id == id && *s_id == session_id && *m_id == model_id
+            choice,
+            .. } if *a_id == id && *s_id == session_id && choice.model_id == model_id
     )));
 }
 #[test]
@@ -1262,8 +1311,8 @@ fn deferred_model_switch_applied_on_worktree_session_created() {
         Effect::SwitchModel {
             agent_id: a_id,
             session_id: s_id,
-            model_id: m_id,
-            .. } if *a_id == id && *s_id == session_id && *m_id == model_id
+            choice,
+            .. } if *a_id == id && *s_id == session_id && choice.model_id == model_id
     )));
 }
 /// The session-startup gate requires BOTH auth AND trust resolved.
@@ -1488,16 +1537,11 @@ fn finish_trust_resolves_and_replays_startup() {
 #[serial_test::serial(GROK_HOME)]
 #[test]
 fn trust_folder_grants_and_resolves() {
-    use xai_grok_workspace::trust::{TrustStore, workspace_key};
+    use xai_grok_workspace::trust::TrustStore;
     let home = tempfile::tempdir().expect("home tempdir");
     unsafe { std::env::set_var("GROK_HOME", home.path()) };
     simulate_release_build();
-    let repo = tempfile::tempdir().expect("repo tempdir");
-    let workspace = workspace_key(repo.path());
-    let mut app = test_app();
-    app.trust_state = TrustState::Pending {
-        workspace: workspace.clone(),
-    };
+    let (_repo, workspace, mut app) = pending_trust_workspace();
     let _ = dispatch(Action::TrustFolder, &mut app);
     assert!(matches!(app.trust_state, TrustState::Done));
     assert!(
@@ -1508,19 +1552,13 @@ fn trust_folder_grants_and_resolves() {
 #[serial_test::serial(GROK_HOME)]
 #[test]
 fn trust_folder_quits_when_store_unreadable() {
-    use xai_grok_workspace::trust::workspace_key;
     let home = tempfile::tempdir().expect("home tempdir");
     unsafe { std::env::set_var("GROK_HOME", home.path()) };
     simulate_release_build();
     let store_path = home.path().join("trusted_folders.toml");
     let before = b"[[[not-toml";
     std::fs::write(&store_path, before).unwrap();
-    let repo = tempfile::tempdir().expect("repo tempdir");
-    let workspace = workspace_key(repo.path());
-    let mut app = test_app();
-    app.trust_state = TrustState::Pending {
-        workspace: workspace.clone(),
-    };
+    let (_repo, workspace, mut app) = pending_trust_workspace();
     let effects = dispatch(Action::TrustFolder, &mut app);
     assert!(
         effects.iter().any(|e| matches!(e, Effect::Quit)),
@@ -1547,37 +1585,78 @@ fn trust_folder_quits_when_store_unreadable() {
 }
 #[serial_test::serial(GROK_HOME)]
 #[test]
-fn trust_folder_quits_when_persist_denied() {
-    use xai_grok_workspace::trust::workspace_key;
+fn trust_folder_continues_session_only_when_embedded_and_persist_denied() {
     let home = tempfile::tempdir().expect("home tempdir");
     let blocker = home.path().join("not-a-dir");
     std::fs::write(&blocker, b"x").unwrap();
     unsafe { std::env::set_var("GROK_HOME", &blocker) };
     simulate_release_build();
-    let repo = tempfile::tempdir().expect("repo tempdir");
-    let workspace = workspace_key(repo.path());
-    let mut app = test_app();
-    app.trust_state = TrustState::Pending {
-        workspace: workspace.clone(),
-    };
+    let (_repo, workspace, mut app) = pending_trust_workspace();
+    app.leader_mode = false;
     let effects = dispatch(Action::TrustFolder, &mut app);
     assert!(
-        effects.iter().any(|e| matches!(e, Effect::Quit)),
-        "failed store write must quit like Welcome n"
+        !effects.iter().any(|e| matches!(e, Effect::Quit)),
+        "an embedded session must not quit; the process-local grant still trusts the session"
     );
     assert!(
-        !matches!(app.trust_state, TrustState::Done),
-        "failed store write must not finish trust"
-    );
-    let msg = app.trust_quit_error.as_deref().unwrap_or("");
-    assert!(
-        msg.starts_with("error: folder trust was not saved"),
-        "failed store write must record a post-exit error: {msg}"
+        matches!(app.trust_state, TrustState::Done),
+        "a session-local grant must finish trust so startup proceeds"
     );
     assert!(
-        msg.contains("grok --trust"),
-        "failed store write must name the next step: {msg}"
+        xai_grok_workspace::folder_trust::is_trusted_this_process(&workspace),
+        "the process-local grant must trust this folder for the session"
     );
+    let toast = app
+        .welcome_toast
+        .as_ref()
+        .map(|(m, _)| m.as_str())
+        .unwrap_or_default();
+    assert!(
+        toast.contains("grok --trust"),
+        "a session-only grant must show how to persist: {toast}"
+    );
+}
+#[test]
+fn trust_gate_outcome_maps_every_case() {
+    use crate::app::dispatch::session::lifecycle::{
+        AgentLocation, TrustGateOutcome, trust_gate_outcome,
+    };
+    use xai_grok_workspace::folder_trust::GrantResolution;
+    let cases = [
+        (
+            GrantResolution::Trusted,
+            AgentLocation::Embedded,
+            TrustGateOutcome::Finish,
+        ),
+        (
+            GrantResolution::Trusted,
+            AgentLocation::Leader,
+            TrustGateOutcome::Finish,
+        ),
+        (
+            GrantResolution::SessionLocal,
+            AgentLocation::Embedded,
+            TrustGateOutcome::FinishSessionLocal,
+        ),
+        (
+            GrantResolution::SessionLocal,
+            AgentLocation::Leader,
+            TrustGateOutcome::Quit,
+        ),
+        (
+            GrantResolution::Unrecorded,
+            AgentLocation::Embedded,
+            TrustGateOutcome::Quit,
+        ),
+        (
+            GrantResolution::Unrecorded,
+            AgentLocation::Leader,
+            TrustGateOutcome::Quit,
+        ),
+    ];
+    for (resolution, agent, want) in cases {
+        assert_eq!(want, trust_gate_outcome(resolution, agent));
+    }
 }
 /// When BOTH auth and trust are pending, `AuthComplete` must NOT replay the deferred startup.
 /// The trust question renders next, and its answer drains it.
@@ -2134,6 +2213,7 @@ fn session_failed_orphan_restores_dashboard_attach_to_survivor() {
         Action::TaskComplete(TaskResult::SessionFailed {
             agent_id: fail_id,
             error: "No space left on device".to_string(),
+            timed_out: false,
         }),
         &mut app,
     );
@@ -2170,6 +2250,7 @@ fn session_failed_last_orphan_clears_dashboard_attach() {
         Action::TaskComplete(TaskResult::SessionFailed {
             agent_id: AgentId(0),
             error: "No space left on device".to_string(),
+            timed_out: false,
         }),
         &mut app,
     );
@@ -3199,32 +3280,6 @@ fn session_id_resolver_round_trip_top_level() {
     };
     assert!(resolver.resolve(&absent).is_none());
 }
-/// Subagent resolver round-trip.
-#[test]
-fn session_id_resolver_round_trip_subagent() {
-    use crate::views::dashboard::{DashboardRowId, PersistedRowId, SessionIdResolver};
-    let mut app = test_app_with_agent();
-    let agent = app.agents.get_mut(&AgentId(0)).unwrap();
-    let info = make_test_subagent("child-1", "sa-1");
-    agent
-        .subagent_sessions
-        .insert(info.child_session_id.to_string(), info);
-    let resolver = SessionIdResolver::from_agents(&app.agents);
-    let pid = PersistedRowId::Subagent {
-        parent_session_id: "test-session".into(),
-        child_session_id: "child-1".into(),
-    };
-    let live = resolver.resolve(&pid).expect("must resolve");
-    assert_eq!(
-        live,
-        DashboardRowId::Subagent {
-            parent: AgentId(0),
-            child_session_id: "child-1".into(),
-        }
-    );
-    let back = resolver.to_persisted(&live).expect("must reverse");
-    assert_eq!(back, pid);
-}
 #[cfg(feature = "local-workspace")]
 mod welcome_workspace_mode {
     use super::*;
@@ -4047,6 +4102,7 @@ mod welcome_workspace_mode {
                 model_id: None,
                 permission_mode_override: None,
                 preferred_session_id: None,
+                minted_session_id: None,
                 chat_kind: false,
             }],
             true
@@ -4061,6 +4117,7 @@ mod welcome_workspace_mode {
                     model_id: None,
                     permission_mode_override: None,
                     preferred_session_id: None,
+                    minted_session_id: None,
                     chat_kind: false,
                 }],
                 true

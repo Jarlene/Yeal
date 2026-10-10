@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use xai_grok_hooks::discovery::HookSource;
+pub use xai_grok_hooks::discovery::HookSourceConfig;
 use xai_grok_tools::registry::types::{SessionContext, ToolRegistryBuilder, ToolServerConfig};
 use xai_tool_runtime::ToolApprovalPolicy;
 /// Default capacity for the workspace event broadcast channel.
@@ -91,8 +91,8 @@ pub struct WorkspaceBindConfig {
     pub viewer_ctx: Option<xai_tool_runtime::WorkspaceViewerContext>,
     /// Initial auto-approve (YOLO) state. `None` on legacy payloads fails closed (false).
     pub yolo_mode: Option<bool>,
-    /// The hub-set attended-execution ceiling; absent or malformed falls back to
-    /// [`ToolApprovalPolicy::GrantsAllowed`], never to unattended.
+    /// The hub-set attended-execution ceiling; omitted → [`ToolApprovalPolicy::GrantsAllowed`],
+    /// present-but-unparseable → [`ToolApprovalPolicy::AlwaysPrompt`].
     pub tool_approval_policy: ToolApprovalPolicy,
     /// Plane-configured toolset in the gRPC wire shape. An empty list is treated as unset (proto3 repeated default).
     pub tools: Option<Vec<xai_grok_tools_api::ToolConfigEntry>>,
@@ -151,7 +151,17 @@ impl WorkspaceBindConfig {
                 .and_then(|v| parse_field("tool_config", v)),
             viewer_ctx: wire.viewer_ctx,
             yolo_mode: wire.yolo_mode,
-            tool_approval_policy: wire.tool_approval_policy.unwrap_or_default(),
+            tool_approval_policy: match wire.tool_approval_policy {
+                Some(Ok(policy)) => policy,
+                Some(Err(raw)) => {
+                    tracing::warn!(
+                        tool_approval_policy = %raw,
+                        "session.bind metadata: unreadable tool_approval_policy; applying always_prompt"
+                    );
+                    ToolApprovalPolicy::AlwaysPrompt
+                }
+                None => ToolApprovalPolicy::GrantsAllowed,
+            },
             tools: Some(wire.tools).filter(|tools| !tools.is_empty()),
             manifest_version: wire.manifest_version,
             manifest_hash: wire.manifest_hash,
@@ -355,7 +365,7 @@ mod bind_config_tests {
         );
         for metadata in [
             serde_json::json!({"preset": "explore"}),
-            serde_json::json!({"tool_approval_policy": "unattended"}),
+            serde_json::json!({"tool_approval_policy": null}),
         ] {
             assert_eq!(
                 ToolApprovalPolicy::GrantsAllowed,
@@ -363,6 +373,37 @@ mod bind_config_tests {
                 "{metadata}"
             );
         }
+        assert_eq!(
+            ToolApprovalPolicy::UnattendedAllowed,
+            WorkspaceBindConfig::from_metadata(&serde_json::json!({
+                "tool_approval_policy": "unattended_allowed",
+            }))
+            .tool_approval_policy,
+        );
+    }
+    /// A ceiling the hub stamped but this binary cannot read (a newer wire token, a typo,
+    /// the wrong JSON type) is the strict arm, never the omitted-field compat default.
+    #[test]
+    fn workspace_bind_config_malformed_tool_approval_policy_is_always_prompt() {
+        for metadata in [
+            serde_json::json!({"tool_approval_policy": "unattended"}),
+            serde_json::json!({"tool_approval_policy": "not_a_policy"}),
+            serde_json::json!({"tool_approval_policy": "GrantsAllowed"}),
+            serde_json::json!({"tool_approval_policy": true}),
+            serde_json::json!({"tool_approval_policy": 1}),
+            serde_json::json!({"preset": "explore", "tool_approval_policy": ["grants_allowed"]}),
+        ] {
+            let cfg = WorkspaceBindConfig::from_metadata(&metadata);
+            assert_eq!(
+                ToolApprovalPolicy::AlwaysPrompt,
+                cfg.tool_approval_policy,
+                "{metadata}"
+            );
+        }
+        let cfg = WorkspaceBindConfig::from_metadata(
+            &serde_json::json!({"preset": "explore", "tool_approval_policy": "unattended"}),
+        );
+        assert_eq!(Some("explore"), cfg.preset.as_deref());
     }
     #[test]
     fn workspace_bind_config_extracts_system_notifications_flag() {
@@ -754,6 +795,8 @@ pub struct BindMcpConfig {
     /// Server names designated first-party app endpoints — see
     /// [`Self::with_first_party_servers`].
     first_party: std::sync::Arc<std::collections::HashSet<String>>,
+    /// The call gate for each server name, set with [`Self::with_call_gate`].
+    call_gates: Arc<crate::mcp::McpCallGates>,
 }
 impl BindMcpConfig {
     pub const DEFAULT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -773,6 +816,7 @@ impl BindMcpConfig {
             servers: servers.into(),
             discovery_timeout: Self::DEFAULT_DISCOVERY_TIMEOUT,
             first_party: std::sync::Arc::new(std::collections::HashSet::new()),
+            call_gates: Arc::default(),
         }
     }
     pub fn with_discovery_timeout(mut self, timeout: Duration) -> Self {
@@ -788,6 +832,19 @@ impl BindMcpConfig {
     }
     pub fn first_party_servers(&self) -> &std::collections::HashSet<String> {
         &self.first_party
+    }
+    /// `gate` checks every tool call to the server named `server`, a host's own built-in server.
+    /// A server that started before this call keeps the gate it started with.
+    pub fn with_call_gate(
+        mut self,
+        server: impl Into<String>,
+        gate: Arc<dyn crate::mcp::McpCallGate>,
+    ) -> Self {
+        Arc::make_mut(&mut self.call_gates).insert(server.into(), gate);
+        self
+    }
+    pub fn call_gates(&self) -> &crate::mcp::McpCallGates {
+        &self.call_gates
     }
     pub fn servers(&self) -> &[agent_client_protocol::McpServer] {
         &self.servers
@@ -864,6 +921,9 @@ pub struct WorkspaceConfig {
     pub tool_approval: ToolApprovalGate,
     /// Which host runs this server; decides whether the root's `FsChanged` producer is lit.
     pub host_kind: crate::host_kind::WorkspaceHostKind,
+    /// The folder's per-command shell sandbox; `None` on hosts that do not sandbox commands (the
+    /// CLI, the remote sandbox server). The session factory must carry its launch hook.
+    pub sandbox: Option<Arc<crate::sandbox::WorkspaceSandbox>>,
 }
 /// Metadata a tool server announces so hub consumers can identify and route to it.
 /// Re-export of the protocol crate's single catalog of well-known registration-metadata keys; every field is optional and independently sourced.
@@ -926,6 +986,7 @@ impl WorkspaceConfig {
             tool_approval: ToolApprovalGate::Off,
             status_config,
             host_kind: Default::default(),
+            sandbox: None,
         }
     }
 }
@@ -985,23 +1046,6 @@ impl std::fmt::Debug for AgentSessionConfig {
             .field("extra_env", &self.extra_env)
             .field("parent_session_id", &self.parent_session_id)
             .finish()
-    }
-}
-/// A single hook source: either a JSON settings file or a directory of `*.json` hook files.
-/// Maps 1:1 to [`xai_grok_hooks::discovery::HookSource`] but uses owned `PathBuf` so the config struct is `'static`.
-#[derive(Debug, Clone)]
-pub enum HookSourceConfig {
-    /// A single JSON settings file (e.g. `~/.claude/settings.json`).
-    SettingsFile(PathBuf),
-    /// A directory of `*.json` hook files (e.g. `~/.grok/hooks/`).
-    Directory(PathBuf),
-}
-impl HookSourceConfig {
-    pub fn as_hook_source(&self) -> HookSource<'_> {
-        match self {
-            Self::SettingsFile(path) => HookSource::SettingsFile(path),
-            Self::Directory(path) => HookSource::Directory(path),
-        }
     }
 }
 /// Filesystem isolation strategy for a forked session.

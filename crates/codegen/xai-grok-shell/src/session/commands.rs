@@ -23,6 +23,12 @@ pub struct CancellationContext {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger: Option<String>,
 }
+/// The parent's exact tool schema paired with the selection mode it advertised.
+#[derive(Debug, Clone)]
+pub struct ForkedToolSnapshot {
+    pub specs: Vec<xai_grok_sampling_types::ToolSpec>,
+    pub task_model_selection: crate::agent::remote_config::task_model_policy::TaskModelSelection,
+}
 /// The ways a `/btw` side question can fail.
 /// Kept typed until the ACP boundary so model errors keep their typed rate-limit and auth codes instead of flattening to a string.
 /// `handle_btw` maps them with [`map_sampling_err_to_acp`](crate::sampling::error::map_sampling_err_to_acp).
@@ -87,7 +93,39 @@ pub fn meta_category_str(
         CancellationCategory::MidTurnAbort => MID_TURN_ABORT_CATEGORY,
     }
 }
+/// The `cancelTrigger`, `cancellationCategory`, and `cancellationContext` `_meta` keys of a turn end, each only when set.
+/// The untyped rails build them here so they spell the keys the same way; `PromptResponseMeta` carries them as typed fields.
+pub fn cancellation_meta(
+    trigger: Option<&str>,
+    category: Option<&str>,
+    context: Option<serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut meta = serde_json::Map::new();
+    if let Some(trigger) = trigger {
+        meta.insert("cancelTrigger".to_owned(), serde_json::Value::from(trigger));
+    }
+    if let Some(category) = category {
+        meta.insert(
+            "cancellationCategory".to_owned(),
+            serde_json::Value::from(category),
+        );
+    }
+    if let Some(context) = context {
+        meta.insert("cancellationContext".to_owned(), context);
+    }
+    meta
+}
 impl PromptCompletionKind {
+    /// A running turn stopped by a cancel. `trigger` names the request, such as `"ctrl_c"`, `"send_now"`, or `"session_close"`.
+    pub fn mid_turn_abort(trigger: Option<&str>) -> Self {
+        Self::Cancelled {
+            category: Some(xai_grok_session_events::types::CancellationCategory::MidTurnAbort),
+            context: trigger.map(|trigger| CancellationContext {
+                trigger: Some(trigger.to_owned()),
+                ..CancellationContext::default()
+            }),
+        }
+    }
     /// The completion's `_meta.cancellationCategory`, shared by every terminal rail so the wires never disagree.
     /// The rails: `PromptResponse` `_meta`, the legacy `prompt_complete`, and the durable `TurnCompleted`.
     pub fn cancellation_category_meta(&self) -> Option<String> {
@@ -98,6 +136,17 @@ impl PromptCompletionKind {
             Self::MaxTurnsReached { .. } => Some(MAX_TURNS_REACHED_CATEGORY.to_string()),
             Self::StationarityEnded => Some(ACTION_STATIONARITY_CATEGORY.to_string()),
             Self::Completed | Self::Rewound | Self::RemovedFromQueue => None,
+        }
+    }
+    /// The completion's `_meta.cancelTrigger`.
+    pub fn cancel_trigger(&self) -> Option<&str> {
+        match self {
+            Self::Cancelled { context, .. } => context.as_ref()?.trigger.as_deref(),
+            Self::Completed
+            | Self::StationarityEnded
+            | Self::MaxTurnsReached { .. }
+            | Self::Rewound
+            | Self::RemovedFromQueue => None,
         }
     }
     /// The completion's `_meta.cancellationContext` (hook name, reason, trigger), stamped beside `cancellationCategory`.
@@ -319,6 +368,22 @@ pub struct SessionModelSwitch {
     /// The session actor stores this on `compaction.threshold_percent` (which is `Cell<u8>` so it can update without `&mut self`).
     pub auto_compact_threshold_percent: u8,
     pub system_prompt_label: String,
+    pub context_window_selection: SwitchContextWindow,
+    /// The new model's default window and menu, from the entry the handler resolved.
+    pub supported_context_windows: Vec<std::num::NonZeroU64>,
+}
+/// How a model switch resolves the session's context window selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwitchContextWindow {
+    /// Keep the session's selection, applied while the new model supports it (a plain user switch).
+    Preserve,
+    /// Use this selection, forgotten when the new model does not support it (a request or restore).
+    Set(Option<std::num::NonZeroU64>),
+}
+#[derive(Debug, Clone, Default)]
+pub struct CurrentModel {
+    pub id: String,
+    pub reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
 }
 pub enum SessionCommand {
     Initialize {
@@ -432,7 +497,7 @@ pub enum SessionCommand {
         context_window: Option<std::num::NonZeroU64>,
     },
     GetCurrentModel {
-        responds_to: oneshot::Sender<String>,
+        responds_to: oneshot::Sender<CurrentModel>,
     },
     GetCurrentPromptMode {
         responds_to: oneshot::Sender<PromptMode>,
@@ -445,7 +510,6 @@ pub enum SessionCommand {
         responds_to: oneshot::Sender<SessionInfoData>,
     },
     CompactSession {
-        user_context: Option<String>,
         respond_to: oneshot::Sender<acp::Result<()>>,
     },
     /// Reload plugin hooks and registry mid-session.
@@ -458,11 +522,22 @@ pub enum SessionCommand {
     ReloadHooks,
     /// Re-discover skills from disk and update the session's skill baseline.
     RefreshSkillBaseline,
-    /// Calls `run_memory_flush("user_requested", None)` on the session actor.
-    /// Returns an error if memory is not enabled for this session.
-    /// Otherwise returns `Ok(true/false)`: whether a flush actually ran (false if another flush was already in progress).
+    /// Capture every finished or stopped turn now for `x.ai/memory/flush`.
     FlushMemory {
-        respond_to: oneshot::Sender<acp::Result<bool>>,
+        respond_to: oneshot::Sender<crate::extensions::memory::MemoryFlushResponse>,
+    },
+    /// Consolidate memory now for `x.ai/memory/dream`, bypassing the automatic gates.
+    MemoryDream {
+        respond_to: oneshot::Sender<crate::extensions::memory::MemoryDreamResponse>,
+    },
+    /// List memory files and state for `x.ai/memory/list`.
+    MemoryList {
+        respond_to: oneshot::Sender<Result<crate::extensions::memory::MemoryListing, String>>,
+    },
+    /// Turn memory on or off for `x.ai/memory/toggle`.
+    MemoryToggle {
+        enabled: bool,
+        respond_to: oneshot::Sender<crate::extensions::memory::MemoryToggleResponse>,
     },
     /// Delete one memory note for `x.ai/memory/forget`.
     MemoryForget {
@@ -544,6 +619,10 @@ pub enum SessionCommand {
         next_trace_turn: u64,
         request_id: Option<String>,
     },
+    /// Tell the model, at its next prompt, that the turn a previous process was running never finished.
+    NoteInterruptedTurn {
+        turn: crate::session::interrupted_turn::InterruptedTurn,
+    },
     /// Flush pending writes and copy the current session directory contents to memory.
     /// The caller can then tar.gz and upload to GCS (or similar).
     CopyFile {
@@ -568,6 +647,9 @@ pub enum SessionCommand {
     /// The caller is notified via `respond_to` once MCP re-initialization completes (or immediately if configs are unchanged).
     UpdateMcpServers {
         mcp_servers: Vec<acp::McpServer>,
+        /// Admitted client list. `Some` replaces the actor seed; `None` leaves it
+        /// (disk/plugin rematerialize).
+        client_seed: Option<Vec<acp::McpServer>>,
         respond_to: oneshot::Sender<Result<(), acp::Error>>,
     },
     /// Re-apply per-attachment policy (MCP init strategy, delivery tools) from a resident `session/load` that carried explicit `startupHints`.
@@ -616,7 +698,7 @@ pub enum SessionCommand {
     /// Snapshot the session's resolved tool schema (the same list the parent's own turn sends).
     /// A verbatim-fork child can then present a byte-identical tool prefix.
     SnapshotToolDefinitions {
-        respond_to: oneshot::Sender<Vec<xai_grok_sampling_types::ToolSpec>>,
+        respond_to: oneshot::Sender<ForkedToolSnapshot>,
     },
     /// Replace the session's client-registered hooks.
     /// Sent on `load_session` reconnect to a live actor so a client can re-register (or clear) its hooks without a fresh session.

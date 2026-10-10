@@ -35,7 +35,6 @@ pub enum ActivePane {
     Queue,
     Prompt,
     Tasks,
-    Catalog,
     /// Consolidated panel dock above the prompt (remote `dock_enabled`).
     Dock,
 }
@@ -53,7 +52,6 @@ pub struct PaneAreas {
     pub queue: Rect,
     pub prompt: Rect,
     pub tasks: Rect,
-    pub catalog: Rect,
     /// Consolidated panel dock (remote `dock_enabled`); the embedded
     /// queue body inside it hit-tests as `Queue` (checked first).
     pub dock: Rect,
@@ -64,9 +62,6 @@ impl PaneAreas {
         let pos = (col, row).into();
         if self.tasks.area() > 0 && self.tasks.contains(pos) {
             return Some(ActivePane::Tasks);
-        }
-        if self.catalog.area() > 0 && self.catalog.contains(pos) {
-            return Some(ActivePane::Catalog);
         }
         if self.todo.area() > 0 && self.todo.contains(pos) {
             return Some(ActivePane::Todo);
@@ -114,7 +109,6 @@ pub struct AgentViewLayoutParams {
     pub timeline_width: u16,
     pub prompt_height: u16,
     pub tasks_height: u16,
-    pub catalog_height: u16,
     pub todo_height: u16,
     pub queue_height: u16,
     pub btw_height: u16,
@@ -129,6 +123,8 @@ pub struct AgentViewLayoutParams {
     pub dock_height: u16,
     /// 0 or 1: the gap row between turn status (or scrollback) and the prompt.
     pub prompt_gap: u16,
+    /// The current model's notice row directly above the prompt, 0 when it has none.
+    pub model_notice_height: u16,
     pub voice_recording_height: u16,
     pub shortcuts_height: u16,
     /// Clamped to the rows left over once every other row and the scrollback minimum are counted.
@@ -141,7 +137,6 @@ pub struct AgentViewLayoutParams {
 pub struct AgentViewLayout {
     pub status_bar: Rect,
     pub tasks: Rect,
-    pub catalog: Rect,
     pub scrollback: Rect,
     pub todo: Rect,
     pub queue: Rect,
@@ -157,6 +152,8 @@ pub struct AgentViewLayout {
     /// Consolidated panel dock (Subagents/Tasks/Watchers/Queued) directly
     /// above the prompt; zero-area when hidden.
     pub dock: Rect,
+    /// The current model's notice, directly above the record indicator and the prompt.
+    pub model_notice: Rect,
     /// Single-row record indicator ("◉ Recording") directly above the prompt, shown only while voice capture is active.
     pub voice_recording: Rect,
     pub prompt: Rect,
@@ -186,7 +183,6 @@ impl AgentViewLayout {
             timeline_width,
             prompt_height,
             tasks_height,
-            catalog_height,
             todo_height,
             queue_height,
             btw_height,
@@ -196,6 +192,7 @@ impl AgentViewLayout {
             follow_ups_height,
             dock_height,
             prompt_gap,
+            model_notice_height,
             voice_recording_height,
             shortcuts_height,
             status_line_height,
@@ -232,10 +229,6 @@ impl AgentViewLayout {
         if tasks_height > 0 {
             constraints.push(Constraint::Length(pane_gap));
             constraints.push(Constraint::Length(tasks_height));
-        }
-        if catalog_height > 0 {
-            constraints.push(Constraint::Length(pane_gap));
-            constraints.push(Constraint::Length(catalog_height));
         }
         if todo_height > 0 {
             constraints.push(Constraint::Length(pane_gap));
@@ -275,6 +268,9 @@ impl AgentViewLayout {
         if prompt_gap > 0 {
             constraints.push(Constraint::Length(prompt_gap));
         }
+        if model_notice_height > 0 {
+            constraints.push(Constraint::Length(model_notice_height));
+        }
         if voice_recording_height > 0 {
             constraints.push(Constraint::Length(voice_recording_height));
         }
@@ -300,12 +296,6 @@ impl AgentViewLayout {
         let mut chunks = chunks.iter().copied();
         let status_bar = chunks.next().unwrap_or_default();
         let tasks = if tasks_height > 0 {
-            chunks.next();
-            chunks.next().unwrap_or_default()
-        } else {
-            Rect::default()
-        };
-        let catalog = if catalog_height > 0 {
             chunks.next();
             chunks.next().unwrap_or_default()
         } else {
@@ -364,6 +354,11 @@ impl AgentViewLayout {
         if prompt_gap > 0 {
             chunks.next();
         }
+        let model_notice = if model_notice_height > 0 {
+            chunks.next().unwrap_or_default()
+        } else {
+            Rect::default()
+        };
         let voice_recording = if voice_recording_height > 0 {
             chunks.next().unwrap_or_default()
         } else {
@@ -403,7 +398,6 @@ impl AgentViewLayout {
         Self {
             status_bar,
             tasks,
-            catalog,
             scrollback,
             todo,
             queue,
@@ -413,6 +407,7 @@ impl AgentViewLayout {
             plugin_cta,
             follow_ups,
             dock,
+            model_notice,
             voice_recording,
             prompt,
             shortcuts,
@@ -453,7 +448,6 @@ impl AgentViewLayout {
             queue: self.queue,
             prompt: self.prompt,
             tasks: self.tasks,
-            catalog: self.catalog,
             dock: self.dock,
         }
     }
@@ -712,7 +706,7 @@ pub(crate) fn build_hints(
     queue_mutation: QueueMutation,
     selected_is_user_prompt: bool,
     selected_is_agent_message: bool,
-    shift_enter_unavailable: bool,
+    prefer_alt_enter_newline: bool,
     scrollback_search: Option<&ScrollbackSearchState>,
 ) -> Vec<HintItem> {
     let mut hints = match active_pane {
@@ -786,7 +780,7 @@ pub(crate) fn build_hints(
         }
         ActivePane::Prompt => {
             let mut hints = Vec::new();
-            let newline_key = if shift_enter_unavailable {
+            let newline_key = if prefer_alt_enter_newline {
                 crate::key!(Enter, ALT)
             } else {
                 crate::key!(Enter, SHIFT)
@@ -803,8 +797,12 @@ pub(crate) fn build_hints(
                     hints.push(HintItem::new(key, "send now"));
                 }
             }
-            if shift_enter_unavailable && !multiline_mode && prompt.can_send() {
-                hints.push(HintItem::new(crate::key!(Enter, ALT), "newline"));
+            if !multiline_mode && prompt.can_send() {
+                hints.push(if prefer_alt_enter_newline {
+                    HintItem::new(newline_key, "newline")
+                } else {
+                    HintItem::paired(newline_key, crate::key!(Enter, ALT), "newline")
+                });
             }
             if prompt.file_ref_near_cursor() {
                 hints.push(HintItem::new(crate::key!(':'), "lines"));
@@ -849,7 +847,6 @@ pub(crate) fn build_hints(
             ));
             hints
         }
-        ActivePane::Catalog => vec![],
         ActivePane::Scrollback if scrollback_search.is_some() => {
             let mut hints = Vec::new();
             if vim_mode {
@@ -1554,17 +1551,18 @@ mod tests {
     }
     fn prompt_hints_with_text(
         multiline_mode: bool,
-        shift_enter_unavailable: bool,
+        prefer_alt_enter_newline: bool,
     ) -> Vec<HintItem> {
-        prompt_hints_with_text_and_turn(multiline_mode, shift_enter_unavailable, false)
+        prompt_hints_with_text_and_turn("hello", multiline_mode, prefer_alt_enter_newline, false)
     }
     fn prompt_hints_with_text_and_turn(
+        text: &str,
         multiline_mode: bool,
-        shift_enter_unavailable: bool,
+        prefer_alt_enter_newline: bool,
         is_turn_running: bool,
     ) -> Vec<HintItem> {
         let mut prompt = PromptWidget::default();
-        prompt.textarea.insert_str("hello");
+        prompt.textarea.insert_str(text);
         let registry = ActionRegistry::defaults();
         build_hints(
             ActivePane::Prompt,
@@ -1590,13 +1588,13 @@ mod tests {
             QueueMutation::PerRowKind,
             false,
             false,
-            shift_enter_unavailable,
+            prefer_alt_enter_newline,
             None,
         )
     }
     #[test]
     fn prompt_idle_submit_hint_is_send() {
-        let hints = prompt_hints_with_text_and_turn(false, false, false);
+        let hints = prompt_hints_with_text_and_turn("hello", false, false, false);
         let labels: Vec<&str> = hints.iter().map(|h| h.label.as_ref()).collect();
         assert!(
             labels.contains(&"send") && !labels.contains(&"queue"),
@@ -1605,7 +1603,7 @@ mod tests {
     }
     #[test]
     fn prompt_running_submit_hint_is_queue_and_send_now() {
-        let hints = prompt_hints_with_text_and_turn(false, false, true);
+        let hints = prompt_hints_with_text_and_turn("hello", false, false, true);
         let labels: Vec<&str> = hints.iter().map(|h| h.label.as_ref()).collect();
         assert!(
             labels.contains(&"queue"),
@@ -1824,22 +1822,66 @@ mod tests {
     }
     #[test]
     fn prompt_legacy_vte_adds_alt_enter_newline_hint() {
+        use crossterm::event::KeyModifiers;
         let hints = prompt_hints_with_text(false, true);
-        let labels: Vec<&str> = hints.iter().map(|h| h.label.as_ref()).collect();
+        let newline = hints
+            .iter()
+            .find(|h| h.label == "newline")
+            .expect("legacy VTE must surface an explicit Alt+Enter newline hint");
+        let [key] = newline.keys.as_slice() else {
+            panic!(
+                "prefer-Alt newline must be a single key, got {:?}",
+                newline.keys
+            );
+        };
         assert!(
-            labels.contains(&"newline"),
-            "legacy VTE must surface an explicit Alt+Enter newline hint; \
-             got {labels:?}"
+            key.modifiers.contains(KeyModifiers::ALT)
+                && !key.modifiers.contains(KeyModifiers::SHIFT),
+            "legacy VTE newline must be Alt+Enter, got {:?}",
+            key.modifiers
         );
     }
     #[test]
-    fn prompt_modern_terminal_no_newline_hint() {
+    fn prompt_modern_terminal_pairs_shift_and_alt_newline() {
+        use crossterm::event::KeyModifiers;
         let hints = prompt_hints_with_text(false, false);
+        let newline = hints
+            .iter()
+            .find(|h| h.label == "newline")
+            .expect("sendable draft must surface a newline hint");
+        let [shift, alt] = newline.keys.as_slice() else {
+            panic!(
+                "local modern newline must pair Shift+Enter / Alt+Enter, got {:?}",
+                newline.keys
+            );
+        };
+        assert!(
+            shift.modifiers.contains(KeyModifiers::SHIFT),
+            "first chord must be Shift+Enter, got {:?}",
+            shift.modifiers
+        );
+        assert!(
+            alt.modifiers.contains(KeyModifiers::ALT),
+            "second chord must be Alt+Enter, got {:?}",
+            alt.modifiers
+        );
+    }
+    #[test]
+    fn prompt_empty_draft_no_newline_hint() {
+        let hints = prompt_hints_with_text_and_turn("", false, false, false);
         let labels: Vec<&str> = hints.iter().map(|h| h.label.as_ref()).collect();
         assert!(
             !labels.contains(&"newline"),
-            "modern terminals must not show the legacy-VTE newline hint \
-             (Shift+Enter works natively); got {labels:?}"
+            "empty composer must not show newline; got {labels:?}"
+        );
+    }
+    #[test]
+    fn prompt_btw_draft_shows_newline_hint() {
+        let hints = prompt_hints_with_text_and_turn("/btw what about retries", false, true, false);
+        assert!(
+            hints.iter().any(|h| h.label == "newline"),
+            "/btw draft must show newline; got {:?}",
+            hints.iter().map(|h| h.label.as_ref()).collect::<Vec<_>>()
         );
     }
     #[test]
@@ -1848,8 +1890,39 @@ mod tests {
         let labels: Vec<&str> = hints.iter().map(|h| h.label.as_ref()).collect();
         assert!(
             !labels.contains(&"newline"),
-            "multiline mode must not show the legacy-VTE newline hint \
+            "multiline mode must not show the extra newline hint \
              (Enter already inserts a newline); got {labels:?}"
+        );
+    }
+    #[test]
+    fn prompt_newline_footer_renders_alt_enter_when_prefer_alt() {
+        use crate::views::shortcuts_bar::ShortcutsBar;
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::Widget;
+        let hints = prompt_hints_with_text(false, true);
+        let area = Rect::new(0, 0, 80, 1);
+        let mut buf = Buffer::empty(area);
+        ShortcutsBar::new(&hints)
+            .compact(5, None)
+            .render(area, &mut buf);
+        let text: String = (0..80)
+            .map(|x| buf.cell((x, 0)).expect("cell").symbol().to_owned())
+            .collect::<String>()
+            .trim_end()
+            .to_owned();
+        let alt = if cfg!(target_os = "macos") {
+            "Opt+Enter"
+        } else {
+            "Alt+Enter"
+        };
+        assert!(
+            text.contains("Enter:send") && text.contains(&format!("{alt}:newline")),
+            "SSH/prefer-Alt footer must show Enter send and {alt} newline, got {text:?}"
+        );
+        assert!(
+            !text.contains("Shift+Enter:newline"),
+            "prefer-Alt footer must not advertise Shift+Enter as newline, got {text:?}"
         );
     }
     #[test]
@@ -2019,6 +2092,21 @@ mod tests {
             25 - 11 - 4,
             "each row above the prompt takes its own height plus the gap above it"
         );
+    }
+    #[test]
+    fn model_notice_row_sits_above_the_record_indicator_and_prompt() {
+        let layout = AgentViewLayout::compute(AgentViewLayoutParams {
+            prompt_height: 3,
+            prompt_gap: 1,
+            model_notice_height: 1,
+            voice_recording_height: 1,
+            ..base_params(Rect::new(0, 0, 80, 30))
+        });
+        assert_eq!(1, layout.model_notice.height);
+        assert_eq!(layout.voice_recording.y, layout.model_notice.y + 1);
+        assert_eq!(layout.prompt.y, layout.voice_recording.y + 1);
+        assert_eq!(layout.prompt.x, layout.model_notice.x);
+        assert_eq!(layout.prompt.width, layout.model_notice.width);
     }
     #[test]
     fn prompt_budget_excludes_the_prompts_own_requested_height() {

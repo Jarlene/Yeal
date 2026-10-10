@@ -45,26 +45,17 @@ pub(crate) enum BuiltinGate {
     WorkflowLaunches,
     WorkflowManagement,
 }
-fn resolve_compact(args: &str) -> BuiltinAction {
-    BuiltinAction::Compact {
-        user_context: if args.is_empty() {
-            None
-        } else {
-            Some(args.to_string())
-        },
-    }
-}
 /// Order here is the display order in autocomplete.
 pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     BuiltinCommand {
         name: "compact",
         description: "Compress conversation history to save context window",
-        argument_hint: Some("optional context about what to preserve"),
+        argument_hint: None,
         aliases: &[],
         model_authored_eligibility: ModelAuthoredEligibility::ExactCanonical,
         gate: BuiltinGate::AlwaysOn,
         workflow_projection: WorkflowProjection::None,
-        resolve: resolve_compact,
+        resolve: |_args| BuiltinAction::Compact,
     },
     BuiltinCommand {
         name: "always-approve",
@@ -104,20 +95,12 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     BuiltinCommand {
         name: "memory",
         description: "Browse, view, and manage your memories",
-        argument_hint: Some("on|off"),
+        argument_hint: None,
         aliases: &["mem"],
         model_authored_eligibility: ModelAuthoredEligibility::Denied,
         gate: BuiltinGate::MemoryConfigured,
         workflow_projection: WorkflowProjection::None,
-        resolve: |args| {
-            let trimmed = args.trim().to_lowercase();
-            match trimmed.as_str() {
-                "on" | "enable" => BuiltinAction::MemoryToggle { enabled: true },
-                "off" | "disable" => BuiltinAction::MemoryToggle { enabled: false },
-                "status" => BuiltinAction::MemoryStatus,
-                _ => BuiltinAction::MemoryBrowse,
-            }
-        },
+        resolve: |_args| BuiltinAction::MemoryBrowse,
     },
     BuiltinCommand {
         name: "context",
@@ -466,6 +449,7 @@ pub const PAGER_COMMAND_KEYS: &[&str] = &[
     "config",
     "config-agents",
     "context",
+    "context-window",
     "copy",
     "cost",
     "dashboard",
@@ -473,6 +457,7 @@ pub const PAGER_COMMAND_KEYS: &[&str] = &[
     "delete",
     "docs",
     "doctor",
+    "dream",
     "edit-prompt",
     "effort",
     "exit",
@@ -480,6 +465,7 @@ pub const PAGER_COMMAND_KEYS: &[&str] = &[
     "export",
     "feedback",
     "find",
+    "flush",
     "fork",
     "full",
     "fullscreen",
@@ -506,6 +492,8 @@ pub const PAGER_COMMAND_KEYS: &[&str] = &[
     "m",
     "marketplace",
     "mcps",
+    "mem",
+    "memory",
     "minimal",
     "ml",
     "model",
@@ -529,7 +517,6 @@ pub const PAGER_COMMAND_KEYS: &[&str] = &[
     "rename",
     "resume",
     "rewind",
-    "scroll-debug",
     "session-info",
     "sessions",
     "settings",
@@ -755,12 +742,7 @@ pub(super) fn available_commands(
         catalog.builtins.len() + catalog.skills.commands.len() + catalog.workflows.len(),
     );
     commands.extend(catalog.builtins.iter().map(|builtin| {
-        acp::AvailableCommand::new(builtin.name.to_string(), builtin.description.to_string())
-            .input(builtin.argument_hint.map(|hint| {
-                acp::AvailableCommandInput::Unstructured(acp::UnstructuredCommandInput::new(
-                    hint.to_string(),
-                ))
-            }))
+        available_command(builtin)
             .meta(exact_workflow_projection(builtin, workflows).map(workflow_meta))
     }));
     commands.extend(catalog.skills.commands.iter().map(|command| {
@@ -828,16 +810,25 @@ pub(crate) fn builtin_commands(availability: CommandAvailability) -> Vec<acp::Av
     BUILTIN_COMMANDS
         .iter()
         .filter(|cmd| availability.allows(cmd.gate))
-        .map(|cmd| {
-            acp::AvailableCommand::new(cmd.name.to_string(), cmd.description.to_string()).input(
-                cmd.argument_hint.map(|hint| {
-                    acp::AvailableCommandInput::Unstructured(acp::UnstructuredCommandInput::new(
-                        hint.to_string(),
-                    ))
-                }),
-            )
-        })
+        .map(available_command)
         .collect()
+}
+/// One builtin by name, as `builtin_commands` would advertise it. For backends that serve a
+/// subset of the shell's commands and must describe them identically.
+pub fn builtin_command(name: &str) -> Option<acp::AvailableCommand> {
+    BUILTIN_COMMANDS
+        .iter()
+        .find(|cmd| cmd.name == name)
+        .map(available_command)
+}
+fn available_command(cmd: &BuiltinCommand) -> acp::AvailableCommand {
+    acp::AvailableCommand::new(cmd.name.to_string(), cmd.description.to_string()).input(
+        cmd.argument_hint.map(|hint| {
+            acp::AvailableCommandInput::Unstructured(acp::UnstructuredCommandInput::new(
+                hint.to_string(),
+            ))
+        }),
+    )
 }
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1193,6 +1184,8 @@ pub(crate) struct ParsedSkillRef {
     /// Plugin name if this is a plugin skill.
     pub plugin_name: Option<String>,
     pub scope: SkillScope,
+    /// Validated frontmatter `origin` slug, used for telemetry.
+    pub origin: Option<String>,
 }
 #[derive(Debug)]
 pub(super) enum SlashCommandOutcome {
@@ -1209,9 +1202,7 @@ pub(super) enum SlashCommandOutcome {
 }
 #[derive(Debug)]
 pub(super) enum BuiltinAction {
-    Compact {
-        user_context: Option<String>,
-    },
+    Compact,
     SetYolo {
         enabled: bool,
     },
@@ -1252,10 +1243,6 @@ pub(super) enum BuiltinAction {
         text: String,
     },
     MemoryBrowse,
-    MemoryStatus,
-    MemoryToggle {
-        enabled: bool,
-    },
     GoalSet {
         objective: String,
         token_budget: Option<i64>,
@@ -1279,7 +1266,7 @@ pub(super) enum BuiltinAction {
 impl BuiltinAction {
     pub(crate) fn command_name(&self) -> &'static str {
         match self {
-            BuiltinAction::Compact { .. } => "compact",
+            BuiltinAction::Compact => "compact",
             BuiltinAction::SetYolo { .. } => "yolo",
             BuiltinAction::FlushMemory => "flush",
             BuiltinAction::Dream => "dream",
@@ -1300,8 +1287,6 @@ impl BuiltinAction {
             BuiltinAction::PluginsUpdate { .. } => "plugins-update",
             BuiltinAction::Feedback { .. } => "feedback",
             BuiltinAction::MemoryBrowse => "memory",
-            BuiltinAction::MemoryStatus => "memory",
-            BuiltinAction::MemoryToggle { .. } => "memory",
             BuiltinAction::GoalSet { .. }
             | BuiltinAction::GoalStatus
             | BuiltinAction::GoalPause
@@ -1314,7 +1299,7 @@ impl BuiltinAction {
     }
     pub(crate) fn args_provided(&self) -> bool {
         match self {
-            BuiltinAction::Compact { user_context } => user_context.is_some(),
+            BuiltinAction::Compact => false,
             BuiltinAction::SetYolo { .. } => true,
             BuiltinAction::FlushMemory => false,
             BuiltinAction::Dream => false,
@@ -1335,8 +1320,6 @@ impl BuiltinAction {
             BuiltinAction::PluginsUpdate { name } => name.is_some(),
             BuiltinAction::Feedback { text } => !text.is_empty(),
             BuiltinAction::MemoryBrowse => false,
-            BuiltinAction::MemoryStatus => true,
-            BuiltinAction::MemoryToggle { .. } => true,
             BuiltinAction::GoalSet { .. } => true,
             BuiltinAction::GoalStatus
             | BuiltinAction::GoalPause
@@ -1449,6 +1432,7 @@ fn parse_skill_references_with_catalog(
                     qualified_name: format_skill_name(hit.skill),
                     plugin_name: hit.skill.plugin_name.clone(),
                     scope: hit.skill.scope,
+                    origin: hit.skill.origin.clone(),
                 }
             })
             .collect(),
@@ -1563,6 +1547,7 @@ pub(super) fn resolve_model_authored_skill(
             qualified_name: format_skill_name(skill),
             plugin_name: skill.plugin_name.clone(),
             scope: skill.scope,
+            origin: skill.origin.clone(),
         }],
     })
 }

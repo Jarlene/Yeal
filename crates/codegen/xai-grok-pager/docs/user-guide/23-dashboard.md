@@ -68,6 +68,9 @@ directory (`Ctrl+G` toggles). **Inactive** is roster-only sessions owned by
 other pager processes that this process has not loaded — background noise, so
 the section **starts collapsed** (expand with `→` / click).
 
+Pinned rows keep their manual order in both grouping modes. Agent activity
+and recent updates do not move them; `Shift+↑` / `Shift+↓` changes their order.
+
 To keep **Idle** scannable, only the most recent idle agents stay visible —
 the 8 freshest, plus any active within the last hour. The rest fold into a
 **"N more"** row at the bottom of the group; select it and press `Enter` /
@@ -88,6 +91,14 @@ has finished — a background task, a `monitor`, or an active scheduled
 
 There are no inline group headers; sort order keeps same-state rows adjacent,
 and the per-row dot + color shows the group.
+
+**Dashboard preview** is under **Appearance** in `/settings` (search for "preview").
+The list gains space when you turn off the preview and reply panel.
+You must open a session to reply or answer permissions with the preview off.
+The new-agent prompt stays available.
+The setting persists across restarts.
+You can turn it back on in the same place.
+`[ui] dashboard_preview = true` in `config.toml` also enables it.
 
 The dispatch input uses the same prompt chrome as the agent view. Press
 `Ctrl+/` to flip it into **search mode**: the `❯` prefix becomes a yellow
@@ -235,7 +246,7 @@ The selected agent's **model** and, in always-approve (yolo) mode, an
 the dispatch box), including while answering questions. List rows no longer
 repeat model or always-approve badges.
 
-**`Shift+Tab` cycles the peeked agent's mode** (Normal → Plan → Auto
+**`Shift+Tab` cycles the peeked agent's mode** (Normal → Plan → Auto-review
 (when enabled) → Always-approve → Normal) on the **live** agent. On the dispatch box,
 Shift+Tab only stages mode for the *next* agent.
 
@@ -300,7 +311,7 @@ Per-user preferences under `[dashboard]` in `~/.grok/config.toml`:
 [dashboard]
 enabled = true
 grouping = "state"   # or "directory"
-pinned   = ["top:<session_id>", "sub:<parent_session_id>:<child_session_id>"]
+pinned   = ["top:<session_id>"]
 reorder  = ["top:<session_id>"]
 ```
 

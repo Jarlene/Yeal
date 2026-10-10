@@ -155,6 +155,7 @@ pub(crate) fn test_app() -> AppView {
         bootstrap_acp_commands: Vec::new(),
         auth_methods: Vec::new(),
         auth_state: AuthState::Done,
+        logout_pending: false,
         trust_state: TrustState::Done,
         consent_state: crate::app::consent::ConsentState::Done,
         account_email: None,
@@ -172,18 +173,23 @@ pub(crate) fn test_app() -> AppView {
         auth_clipboard_delivery: None,
         auth_clipboard_feedback_generation: 0,
         team_id: None,
+        is_team_principal: false,
         team_name: None,
         is_zdr: false,
         team_role: None,
+        can_administer_team: None,
         coding_data_retention_opt_out: true,
         privacy_notice_rollout: false,
         privacy_banner_reshow_days: None,
         privacy_banner_acked: None,
-        privacy_banner_opt_in_inflight: false,
+        coding_data_pending_write: None,
         coding_data_write_seq: 0,
         show_tips: None,
         auto_update: None,
         ask_user_question_timeout_enabled: None,
+        subagent_model_inheritance: crate::settings::FeatureOverrideState::new(
+            xai_grok_shell::agent::config::Feature::SubagentModelInheritance,
+        ),
         zdr_access_enabled: false,
         usage_billing_redirect_url: None,
         access_gate_shown_logged: false,
@@ -232,6 +238,8 @@ pub(crate) fn test_app() -> AppView {
         #[cfg(feature = "local-workspace")]
         welcome_on_workspace_mode: false,
         welcome_toast: None,
+        dispatch_depth: 0,
+        pending_image_notices: Vec::new(),
         welcome_on_privacy_banner: false,
         welcome_on_upgrade_cta: false,
         welcome_changelog_cta_rect: None,
@@ -310,9 +318,13 @@ pub(crate) fn test_app() -> AppView {
         dashboard_persisted: None,
         keyboard_normalizer: KeyboardNormalizer::from_terminal_context(),
         voice_mode_enabled: false,
+        distribution: xai_grok_config::Distribution::STOCK,
         voice_ui_active: false,
         voice_config: xai_grok_voice::VoiceConfig::default(),
         voice_auth: None,
+        voice_session: xai_grok_voice::VoiceSessionId::default(),
+        voice_trailing_final: None,
+        voice_clip_deadline: None,
         voice_cmd_tx: None,
         voice_state: VoiceState::Idle,
     }
@@ -1750,6 +1762,39 @@ fn needs_animation_gates_extensions_modal_loading_spinner() {
     );
 }
 #[test]
+fn needs_animation_gates_memory_modal_copy_message() {
+    use crate::views::memory_modal::MemoryModalState;
+    use crate::views::modal::ActiveModal;
+    let mut app = test_app_with_agent();
+    let id = super::super::agent::AgentId(0);
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.active_modal = Some(ActiveModal::MemoryBrowser {
+        state: Box::new(MemoryModalState::new(Vec::new())),
+    });
+    assert!(
+        !app.needs_animation(),
+        "an idle memory modal must not request ticks"
+    );
+    let Some(ActiveModal::MemoryBrowser { state }) =
+        app.agents.get_mut(&id).unwrap().active_modal.as_mut()
+    else {
+        panic!("memory modal open");
+    };
+    state.report_copy(&crate::clipboard::CopyDelivery::File {
+        path: std::path::PathBuf::from("/tmp/last-copy.txt"),
+    });
+    assert!(
+        app.needs_animation(),
+        "copy message countdown must keep ticks alive"
+    );
+    let cleared = (0..=120).any(|_| app.tick());
+    assert!(cleared, "tick must expire the copy message");
+    assert!(
+        !app.needs_animation(),
+        "expired copy message must stop requesting ticks"
+    );
+}
+#[test]
 fn needs_animation_gates_pending_acp_command_sync() {
     let mut app = test_app_with_agent();
     let id = super::super::agent::AgentId(0);
@@ -2232,10 +2277,6 @@ fn is_restricted_tier_classification() {
     assert!(!is_restricted_tier(Some("X Premium")));
     assert!(!is_restricted_tier(Some("X Premium+")));
     assert!(!is_restricted_tier(Some("SomeFutureTier")));
-}
-#[test]
-fn voice_included_in_tier_restricted_commands() {
-    assert!(TIER_RESTRICTED_COMMANDS.contains(&"voice"));
 }
 #[test]
 fn is_voice_tier_restricted_tracks_tier() {
@@ -4813,6 +4854,20 @@ fn welcome_done_n_leaves_home() {
     assert!(app.welcome_prompt.text().is_empty());
 }
 #[test]
+fn welcome_done_ctrl_p_leaves_home() {
+    for focused in [true, false] {
+        let mut app = test_app();
+        app.auth_state = AuthState::Done;
+        app.welcome_prompt_focused = focused;
+        let outcome = app.handle_input(&key_event(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert!(
+            matches!(outcome, InputOutcome::ActionThenForward(Action::LeaveHome)),
+            "focused={focused}: Ctrl+P must leave home to open the command palette, got {outcome:?}"
+        );
+        assert!(app.welcome_prompt.text().is_empty());
+    }
+}
+#[test]
 fn welcome_done_ctrl_w_opens_new_worktree_dialog() {
     let mut app = test_app();
     app.auth_state = AuthState::Done;
@@ -5201,7 +5256,6 @@ fn moved_after_press_ends_gesture_instead_of_promoting() {
         None,
         false,
         crate::app::agent_view::BannerSlotParams::none(),
-        &BundleState::default(),
         false,
         &mut Vec::new(),
         crate::app::agent_view::AppRenderParams::default(),
@@ -5248,7 +5302,6 @@ fn moved_without_button_does_not_promote_pending_scrollback_drag() {
         None,
         false,
         crate::app::agent_view::BannerSlotParams::none(),
-        &BundleState::default(),
         false,
         &mut Vec::new(),
         crate::app::agent_view::AppRenderParams::default(),
@@ -5298,7 +5351,6 @@ fn scrollback_click_still_selects_entry_on_mouse_up() {
         None,
         false,
         crate::app::agent_view::BannerSlotParams::none(),
-        &BundleState::default(),
         false,
         &mut Vec::new(),
         crate::app::agent_view::AppRenderParams::default(),
@@ -6179,7 +6231,8 @@ fn esc_on_dashboard_while_listening_stops_voice() {
     app.voice_state = VoiceState::Recording {
         hold: false,
         target: VoiceTarget::DashboardDispatch,
-        interim: None,
+        partial: Partial::None,
+        route: None,
     };
     let outcome = app.handle_input(&key_event(KeyCode::Esc, KeyModifiers::NONE));
     assert!(
@@ -6198,7 +6251,8 @@ fn esc_stops_voice_before_closing_dashboard_picker() {
     app.voice_state = VoiceState::Recording {
         hold: false,
         target: VoiceTarget::DashboardDispatch,
-        interim: None,
+        partial: Partial::None,
+        route: None,
     };
     let outcome = app.handle_input(&key_event(KeyCode::Esc, KeyModifiers::NONE));
     assert!(matches!(outcome, InputOutcome::Action(Action::VoiceToggle)));
@@ -6233,12 +6287,40 @@ fn esc_cancels_pending_voice_cold_start() {
     let outcome = app.handle_input(&key_event(KeyCode::Esc, KeyModifiers::NONE));
     assert!(matches!(outcome, InputOutcome::Changed));
     assert!(
-        !app.voice_state.pending_cold_start(),
+        !app.voice_state.is_pending_cold_start(),
         "Esc must cancel the queued cold-start"
     );
     assert!(
         app.voice_recording_target().is_none(),
         "target dropped on cancel"
+    );
+}
+/// Esc on a stopped/uploading clip aborts it rather than falling through to the surface's Esc.
+#[test]
+fn esc_abandons_an_outstanding_clip() {
+    let mut app = test_app();
+    pin_non_vscode_registry(&mut app);
+    app.active_view = ActiveView::AgentDashboard;
+    app.dashboard = Some(crate::views::dashboard::DashboardState::new());
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    app.voice_cmd_tx = Some(tx);
+    app.voice_state = VoiceState::Transcribing {
+        target: VoiceTarget::DashboardDispatch,
+        partial: Partial::None,
+    };
+    let outcome = app.handle_input(&key_event(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(matches!(outcome, InputOutcome::Changed));
+    assert_eq!(VoiceState::Idle, app.voice_state);
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(xai_grok_voice::VoiceCommand::Abort)
+    ));
+    assert_eq!(
+        Some(crate::voice::RECORDING_DISCARDED_TOAST),
+        app.dashboard
+            .as_ref()
+            .and_then(|d| d.error_toast.as_deref()),
+        "the key's effect is named; nothing else on screen showed a recording in flight"
     );
 }
 /// The dictation overlay must only render on the surface that owns the bound target.
@@ -6249,7 +6331,8 @@ fn voice_overlay_bound_to_target_surface() {
     let mut app = test_app();
     app.voice_state = VoiceState::Stopping {
         target: VoiceTarget::Agent(id),
-        interim: Some("partial".into()),
+        partial: Partial::Shown("partial".into()),
+        route: Some(xai_grok_voice::VoiceRoute::Streaming),
     };
     app.active_view = ActiveView::Agent(id);
     assert!(
@@ -6272,7 +6355,8 @@ fn voice_target_on_agent_entered_from_dashboard() {
     app.voice_state = VoiceState::Recording {
         hold: false,
         target: VoiceTarget::Agent(id),
-        interim: None,
+        partial: Partial::None,
+        route: None,
     };
     app.active_view = ActiveView::Agent(id);
     app.dashboard = Some(crate::views::dashboard::DashboardState::new());

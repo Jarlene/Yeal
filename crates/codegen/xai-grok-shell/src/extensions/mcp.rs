@@ -65,6 +65,9 @@ fn default_true() -> bool {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct McpListResponse {
     pub servers: Vec<McpServerEntry>,
+    /// Session-scoped: true when `is_initialized` is set. A missing client is then a failed handshake.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_mcp_resolved: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -212,6 +215,8 @@ pub struct McpStatusSnapshot {
     pub configs: Vec<acp::McpServer>,
     pub clients: Vec<McpClientStatus>,
     pub auth_required: std::collections::HashSet<String>,
+    /// Mirrors `McpState::is_initialized`. A missing client then means handshake failed.
+    pub is_resolved: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -605,7 +610,7 @@ pub(crate) async fn build_mcp_status(
     let (
         configs,
         clients,
-        _is_initializing,
+        is_initialized,
         initializing_servers,
         mcp_tool_meta,
         mcp_tool_icons,
@@ -620,7 +625,7 @@ pub(crate) async fn build_mcp_status(
                 .all_clients()
                 .map(|(_, c)| c.clone())
                 .collect::<Vec<_>>(),
-            state.is_initializing(),
+            state.is_initialized(),
             state.handshaking_servers_cloned(),
             state.mcp_tool_meta.clone(),
             state.mcp_tool_icons.clone(),
@@ -737,6 +742,7 @@ pub(crate) async fn build_mcp_status(
         configs,
         clients: client_statuses,
         auth_required,
+        is_resolved: is_initialized,
     }
 }
 
@@ -925,7 +931,11 @@ pub(crate) fn list_blocked_reasons<'a>(
             let name = crate::session::mcp_servers::mcp_server_name(server);
             // Raw catalog entries carry no source tier; classify through the one classifier with the
             // fail-closed non-native tier (only `project_scoped` feeds the pin arm).
-            let subject = crate::session::managed_mcp::mcp_subject_for_tier(name, false, &project);
+            let subject = crate::session::managed_mcp::mcp_subject_for_tier(
+                name,
+                xai_grok_config::mcp_servers::SessionMcpTier::Foreign,
+                &project,
+            );
             if let Some(reason) = ms.mcp_project_pin_block(server, subject) {
                 blocked.entry(name.to_string()).or_insert(reason);
             }
@@ -1090,6 +1100,9 @@ async fn handle_list(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         }
     }
 
+    let session_mcp_resolved = session_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.is_resolved);
     // Carry the verdict for policy-dropped servers so the pager can say "blocked by policy"
     // instead of a generic "unavailable"; computed only with a session snapshot.
     let blocked_reasons: HashMap<String, String> = match (&session_snapshot, &definition_index) {
@@ -1224,7 +1237,10 @@ async fn handle_list(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
             }
         }
     }
-    to_ext_response(Ok(McpListResponse { servers }))
+    to_ext_response(Ok(McpListResponse {
+        servers,
+        session_mcp_resolved,
+    }))
 }
 
 // ── mcp/call handler ────────────────────────────────────────────────
@@ -1301,6 +1317,7 @@ pub(crate) async fn read_mcp_resource(
         )
     };
 
+    let _request = client.begin_outbound_request();
     let mcp_service = client
         .ensure_initialized()
         .await
@@ -1451,6 +1468,7 @@ impl xai_grok_tools::types::resources::McpResourceProvider for McpStateResourceP
             )
         };
 
+        let _request = client.begin_outbound_request();
         let mcp_service = client
             .ensure_initialized()
             .await
@@ -2132,7 +2150,7 @@ fn upsert_policy_subject(
 ) -> xai_grok_workspace::permission::resolution::McpSubject {
     crate::session::managed_mcp::mcp_subject_for_tier(
         server_name,
-        true,
+        xai_grok_config::mcp_servers::SessionMcpTier::Native,
         &crate::agent::folder_trust::project_scoped_mcp_names(cwd),
     )
 }
@@ -2843,6 +2861,7 @@ mod tests {
                     }),
                 },
             ],
+            session_mcp_resolved: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         // [0] local HTTP

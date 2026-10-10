@@ -16,6 +16,9 @@
 //!   RPCs.
 use crate::computer::types::{AsyncFileSystem, TerminalBackend};
 use crate::notification::types::ToolNotificationHandle;
+/// The per-command sandbox hook, injected by the daemon like [`Terminal`] and [`FileSystem`];
+/// spawn sites that read `Resources` look it up here.
+pub use crate::sandbox_launch::SandboxLaunchHook;
 use serde::Serialize;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
@@ -518,6 +521,9 @@ impl GitignoreFilter {
             gitignore,
             git_root,
         }
+    }
+    pub(crate) fn is_logical_path_ignored(&self, path: &std::path::Path) -> bool {
+        crate::gitignore::is_ignored(&self.gitignore, path, Some(&self.git_root))
     }
     /// Check whether a path is gitignored. For non-existent files (new file creation),
     /// canonicalizes the parent directory to handle symlinks (e.g., macOS `/var` → `/private/var`).

@@ -115,11 +115,10 @@ Write prompts the way you would brief a senior engineer:
 - Do NOT implement code changes yourself \u{2014} you have no file editing tools
 - Do NOT give subagents overly prescriptive step-by-step instructions \u{2014} trust their expertise
 - Do NOT summarize or re-explain what the user said \u{2014} get to work immediately";
-/// Bash tool with clearer model-facing names: `run_terminal_cmd` becomes `run_terminal_command` and `is_background` becomes `background`.
+/// Bash tool with a clearer model-facing name: `run_terminal_cmd` becomes `run_terminal_command`.
+/// `block_until_ms` keeps its canonical name.
 fn bash_tool_config() -> ToolConfig {
-    ToolConfig::from(&grok_build::BashTool)
-        .with_name("run_terminal_command")
-        .with_param_rename("is_background", "background")
+    ToolConfig::from(&grok_build::BashTool).with_name("run_terminal_command")
 }
 /// Task/subagent tool with clearer model-facing names: `task` becomes `spawn_subagent` and `run_in_background` becomes `background`.
 fn task_tool_config() -> ToolConfig {
@@ -777,7 +776,7 @@ pub struct AgentDefinition {
     #[serde(skip)]
     pub system_prompt: TemplateOverride,
     /// First-user-message template selector.
-    /// `Default` (the default) lets the shell layer build the legacy `<user_info>` and `<git_status>` prefix.
+    /// `Default` (the default) lets the shell layer build the legacy `<user_info>` prefix.
     /// `Custom` uses a caller-supplied template string.
     #[serde(default)]
     pub user_message_template: UserMessageTemplate,
@@ -1210,7 +1209,7 @@ fn default_true() -> bool {
     true
 }
 /// Strip a tool id's `Namespace:` prefix, yielding its short name.
-pub(crate) fn short_tool_name(id: &str) -> &str {
+pub fn short_tool_name(id: &str) -> &str {
     id.rsplit(':').next().unwrap_or(id)
 }
 /// Whether an allow/deny `entry` refers to tool `id` (by full id or short name).
@@ -1348,6 +1347,13 @@ impl AgentDefinition {
         _audience: crate::prompt::context::PromptAudience,
     ) -> bool {
         false
+    }
+    /// True for a client-supplied inline profile: no built-in, plugin, or on-disk provenance.
+    pub fn is_inline_profile(&self) -> bool {
+        self.builtin_name.is_none()
+            && self.plugin_name.is_none()
+            && self.source_path.is_none()
+            && self.scope == AgentScope::BuiltIn
     }
     pub fn include_browser_verification(&self) -> bool {
         matches!(
@@ -2437,6 +2443,22 @@ description: Test default tool config
         assert_eq!(recovered.permission_mode, PermissionMode::DontAsk);
         assert_eq!(recovered.tools, vec!["read_file", "grep"]);
         assert_eq!(recovered.disallowed_tools, vec!["web_search"]);
+    }
+    #[test]
+    fn is_inline_profile_only_for_client_supplied_definitions() {
+        let inline = AgentDefinition::from_json(&serde_json::json!({
+            "name": "custom-profile",
+            "description": "A custom profile",
+        }))
+        .unwrap();
+        assert!(inline.is_inline_profile());
+        assert!(!AgentDefinition::grok_build_plan().is_inline_profile());
+        let mut project = inline.clone();
+        project.scope = AgentScope::Project;
+        assert!(!project.is_inline_profile());
+        let mut on_disk = inline.clone();
+        on_disk.source_path = Some(std::path::PathBuf::from("/tmp/custom.md"));
+        assert!(!on_disk.is_inline_profile());
     }
     #[test]
     fn test_model_override_serde_inherit() {

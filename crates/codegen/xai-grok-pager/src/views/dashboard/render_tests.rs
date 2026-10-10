@@ -932,6 +932,7 @@ fn render_narrow_mode_registers_row_rects() {
     let mut state = DashboardState::new();
     let row = DashboardRow {
         id: DashboardRowId::TopLevel(AgentId(1)),
+        session_id: None,
         label: "abcdefghij ".repeat(10),
         subtitle: None,
         state: RowState::Working,
@@ -943,10 +944,6 @@ fn render_narrow_mode_registers_row_rects() {
         pinned: false,
         badges: Vec::new(),
         context_pct: None,
-        indent: 0,
-        parent_label: None,
-        is_more_placeholder: false,
-        more_count: 0,
     };
     let rows = vec![row];
     let theme = Theme::current();
@@ -1196,8 +1193,6 @@ fn render_no_match_paints_filter_hint() {
         "no-match hint should embed the filter value, got: {content:?}"
     );
 }
-
-// ── snap_offset_to_line_boundary unit tests ──────────────────────
 
 /// An offset already on a boundary is returned unchanged.
 #[test]
@@ -1532,6 +1527,7 @@ fn sanitized_rename_draft_is_safe_in_both_render_paths() {
     let id = DashboardRowId::TopLevel(AgentId(7));
     let row = DashboardRow {
         id: id.clone(),
+        session_id: None,
         label: "row label".to_string(),
         subtitle: None,
         state: RowState::Working,
@@ -1543,10 +1539,6 @@ fn sanitized_rename_draft_is_safe_in_both_render_paths() {
         pinned: false,
         badges: Vec::new(),
         context_pct: None,
-        indent: 0,
-        parent_label: None,
-        is_more_placeholder: false,
-        more_count: 0,
     };
     let rows = vec![row];
     let theme = Theme::current();
@@ -1595,6 +1587,7 @@ fn render_rename_overlay_aligns_with_title_and_keeps_icon() {
     let id = DashboardRowId::TopLevel(AgentId(7));
     let row = DashboardRow {
         id: id.clone(),
+        session_id: None,
         label: "row label".to_string(),
         subtitle: None,
         state: RowState::Idle,
@@ -1606,10 +1599,6 @@ fn render_rename_overlay_aligns_with_title_and_keeps_icon() {
         pinned: false,
         badges: Vec::new(),
         context_pct: None,
-        indent: 0,
-        parent_label: None,
-        is_more_placeholder: false,
-        more_count: 0,
     };
     let rows = vec![row];
     let theme = Theme::current();
@@ -1834,6 +1823,7 @@ fn rename_hover_selection_and_delete_geometry_stay_consistent() {
     let id = DashboardRowId::TopLevel(AgentId(7));
     let row = DashboardRow {
         id: id.clone(),
+        session_id: None,
         label: "row label".to_string(),
         subtitle: None,
         state: RowState::Idle,
@@ -1845,10 +1835,6 @@ fn rename_hover_selection_and_delete_geometry_stay_consistent() {
         pinned: false,
         badges: vec![RowBadge::Subagents(1)],
         context_pct: None,
-        indent: 0,
-        parent_label: None,
-        is_more_placeholder: false,
-        more_count: 0,
     };
     let rows = vec![row];
     let text = format!("{}中e\u{301}👩🏽\u{200d}💻", "x".repeat(90));
@@ -2565,6 +2551,53 @@ fn render_rows_emits_pinned_section_at_top() {
     );
 }
 
+#[test]
+fn pinned_rows_render_in_manual_order_after_activity_changes() {
+    for grouping in [Grouping::State, Grouping::Directory] {
+        for width in [30, 100] {
+            let mut first = header_test_row(2, RowState::Idle, "first pin");
+            first.pinned = true;
+            first.cwd_display = "/z".to_owned();
+            let mut second = header_test_row(1, RowState::Idle, "second pin");
+            second.pinned = true;
+            second.cwd_display = "/a".to_owned();
+            let reorder = vec![first.id.clone(), second.id.clone()];
+            let mut rows = vec![
+                first,
+                second,
+                header_test_row(3, RowState::Working, "unpinned"),
+            ];
+            let mut state = DashboardState::new();
+            state.grouping = grouping;
+            state.selected = reorder.first().cloned();
+            let area = Rect::new(0, 0, width, 30);
+
+            for activity in [RowState::Working, RowState::Idle] {
+                let row = rows
+                    .iter_mut()
+                    .find(|row| row.label == "second pin")
+                    .expect("second pin");
+                row.state = activity;
+                row.last_change_at += std::time::Duration::from_secs(60);
+                crate::views::dashboard::sort_rows(&mut rows, grouping, &reorder);
+                let mut buffer = Buffer::empty(area);
+                if width < MIN_DASHBOARD_WIDTH {
+                    render_narrow_rows(&mut buffer, area, &Theme::groknight(), &rows, &mut state);
+                } else {
+                    render_rows(&mut buffer, area, &Theme::groknight(), &rows, &mut state);
+                }
+
+                let text = buf_to_text(&buffer);
+                let first = text.find("first pin").expect("first pin rendered");
+                let second = text.find("second pin").expect("second pin rendered");
+                let unpinned = text.find("unpinned").expect("unpinned row rendered");
+                assert!(first < second && second < unpinned, "{text}");
+                assert_eq!(reorder.first(), state.selected.as_ref());
+            }
+        }
+    }
+}
+
 /// With grouping OFF (Directory) the "Pinned" text header is suppressed.
 /// A textless divider (a horizontal rule, no label) separates the pinned block from the rest; no state headers are emitted either.
 #[test]
@@ -2733,6 +2766,7 @@ fn render_row_two_line_layout_paints_title_and_secondary() {
     state.spinner_tick = 8; // Tick 8 selects dot_spinner_frames()[2], the `⸬` glyph.
     let row = DashboardRow {
         id: DashboardRowId::TopLevel(crate::app::agent::AgentId(1)),
+        session_id: None,
         label: "who are you?".to_string(),
         subtitle: None,
         state: RowState::Working,
@@ -2744,10 +2778,6 @@ fn render_row_two_line_layout_paints_title_and_secondary() {
         pinned: false,
         badges: Vec::new(),
         context_pct: None,
-        indent: 0,
-        parent_label: None,
-        is_more_placeholder: false,
-        more_count: 0,
     };
     render_row(&mut buf, Rect::new(0, 0, 100, 2), &theme, &row, &mut state);
 
@@ -2814,6 +2844,7 @@ fn render_row_selected_brightens_secondary_text() {
     let id = DashboardRowId::TopLevel(crate::app::agent::AgentId(7));
     let row = DashboardRow {
         id: id.clone(),
+        session_id: None,
         label: "investigate caching".to_string(),
         subtitle: None,
         state: RowState::Working,
@@ -2826,10 +2857,6 @@ fn render_row_selected_brightens_secondary_text() {
         pinned: false,
         badges: Vec::new(),
         context_pct: None,
-        indent: 0,
-        parent_label: None,
-        is_more_placeholder: false,
-        more_count: 0,
     };
 
     // Unselected: dim secondary
@@ -2876,6 +2903,7 @@ fn render_row_needs_input_yellow_blink_no_badge_pending_prefix() {
     let theme = Theme::current();
     let make_row = || DashboardRow {
         id: DashboardRowId::TopLevel(crate::app::agent::AgentId(1)),
+        session_id: None,
         label: "ask me".to_string(),
         subtitle: None,
         state: RowState::NeedsInput,
@@ -2887,10 +2915,6 @@ fn render_row_needs_input_yellow_blink_no_badge_pending_prefix() {
         pinned: false,
         badges: vec![RowBadge::NeedsInput],
         context_pct: None,
-        indent: 0,
-        parent_label: None,
-        is_more_placeholder: false,
-        more_count: 0,
     };
     let render = |tick: u64| {
         let mut buf = Buffer::empty(Rect::new(0, 0, 100, 2));
@@ -2963,6 +2987,7 @@ fn render_row_new_session_fallback_label_is_two_tone() {
     let mut state = DashboardState::new();
     let row = DashboardRow {
         id: DashboardRowId::TopLevel(crate::app::agent::AgentId(1)),
+        session_id: None,
         label: "New session #abc12345".to_string(),
         subtitle: None,
         state: RowState::Idle,
@@ -2974,10 +2999,6 @@ fn render_row_new_session_fallback_label_is_two_tone() {
         pinned: false,
         badges: Vec::new(),
         context_pct: None,
-        indent: 0,
-        parent_label: None,
-        is_more_placeholder: false,
-        more_count: 0,
     };
     render_row(&mut buf, Rect::new(0, 0, 100, 2), &theme, &row, &mut state);
 
@@ -3137,57 +3158,6 @@ fn render_rows_skips_headers_when_filter_is_state() {
     );
 }
 
-/// Subagent rows (indent > 0) must NOT trigger their own state header; they inherit their parent's group.
-/// A `Working` parent followed by `Completed` and `Failed` subagents must emit only the parent's `Working` header, not extra ones for the subagents.
-#[test]
-fn render_rows_subagents_do_not_trigger_their_own_headers() {
-    use crate::app::agent::AgentId;
-    let mut buf = Buffer::empty(Rect::new(0, 0, 80, 20));
-    let mut state = DashboardState::new();
-    let parent = DashboardRow {
-        id: DashboardRowId::TopLevel(AgentId(1)),
-        indent: 0,
-        ..header_test_row(1, RowState::Working, "parent")
-    };
-    let sub_completed = DashboardRow {
-        id: DashboardRowId::Subagent {
-            parent: AgentId(1),
-            child_session_id: "c1".to_string(),
-        },
-        label: "sub-completed".to_string(),
-        indent: 1,
-        ..header_test_row(11, RowState::Completed, "sub-completed")
-    };
-    let sub_failed = DashboardRow {
-        id: DashboardRowId::Subagent {
-            parent: AgentId(1),
-            child_session_id: "c2".to_string(),
-        },
-        label: "sub-failed".to_string(),
-        indent: 1,
-        ..header_test_row(12, RowState::Failed, "sub-failed")
-    };
-    let rows = vec![parent, sub_completed, sub_failed];
-    let theme = Theme::current();
-    render_rows(&mut buf, Rect::new(0, 0, 80, 20), &theme, &rows, &mut state);
-    let content = buf_to_text(&buf);
-    // Group header reads `Working 1 ─────` (no parens; the trailing rule fills the rest of the row)
-    assert!(
-        content.contains("Working 1"),
-        "parent's Working header must render, got: {content:?}",
-    );
-    // Subagents inherit their parent's group and must NOT emit their own headers
-    // The trailing `\u{2500}` rule is the marker that distinguishes a header from a row
-    assert!(
-        !content.contains("Completed 1"),
-        "subagent must NOT trigger a Completed header, got: {content:?}",
-    );
-    assert!(
-        !content.contains("Failed 1"),
-        "subagent must NOT trigger a Failed header, got: {content:?}",
-    );
-}
-
 /// Narrow mode emits a compact `Done 12` header (no bullet, no parens, no trailing rule; narrow terminals don't have the width budget).
 #[test]
 fn render_narrow_rows_emits_compact_group_headers() {
@@ -3320,10 +3290,6 @@ fn render_dashboard_paints_full_area_background() {
         "render_dashboard must paint at least one cell with theme.bg_base",
     );
 }
-
-// ─────────────────────────────────────────────────────────────────
-// Location picker tests
-// ─────────────────────────────────────────────────────────────────
 
 /// The location picker modal paints its title and candidate rows and records the content hit areas for mouse handling.
 #[test]

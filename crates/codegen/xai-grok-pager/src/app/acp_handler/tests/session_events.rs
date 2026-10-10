@@ -30,6 +30,182 @@
             Some("hi"),
             "hold prompt text for re-auth auto-resubmit if compact fails with auth"
         );
+        match last_session_event(&scrollback) {
+            Some(SessionEvent::CompactionStarted { percentage, reason }) => {
+                assert_eq!(percentage, 85);
+                assert_eq!(reason, "threshold", "threshold compact keeps its reason");
+            }
+            other => panic!("expected CompactionStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn family_switch_compact_banner_and_idle_loader() {
+        use crate::app::agent::AgentCommand;
+        use xai_grok_shell::extensions::notification::MODEL_FAMILY_SWITCH_COMPACT_BANNER;
+
+        let mut agent = make_agent(Some("s1"));
+        agent.running_wake_turn = Some(crate::app::agent_view::RunningWakeTurn {
+            prompt_id: "task-completed-wake".into(),
+            cancel_sent: false,
+        });
+        let update = XaiSessionUpdate::AutoCompactStarted {
+            tokens_used: 12_000,
+            context_window: 200_000,
+            percentage: 6,
+            reason: MODEL_FAMILY_SWITCH_COMPACT_BANNER.into(),
+        };
+        assert!(apply_child_view_session_event(&mut agent, &update, false));
+        match last_session_event(&agent.scrollback) {
+            Some(SessionEvent::CompactionStarted { percentage, reason }) => {
+                assert_eq!(percentage, 6);
+                assert_eq!(reason, MODEL_FAMILY_SWITCH_COMPACT_BANNER);
+            }
+            other => panic!("expected family-switch CompactionStarted, got {other:?}"),
+        }
+        assert!(
+            agent.session.state.is_compact_running(),
+            "idle family-switch compact must own the turn-status command so the loader shows"
+        );
+        assert!(
+            matches!(
+                agent.session.state,
+                crate::app::agent::AgentState::CommandRunning {
+                    command: AgentCommand::SwitchModelCompact,
+                    ..
+                }
+            ),
+            "got {:?}",
+            agent.session.state
+        );
+        assert!(
+            agent.turn_started_at.is_some(),
+            "turn timer needs turn_started_at, same as /compact"
+        );
+        assert!(
+            agent.running_wake_turn.is_none(),
+            "family-switch compact must drop a leftover wake marker like /compact"
+        );
+
+        let completed = XaiSessionUpdate::AutoCompactCompleted {
+            tokens_before: Some(12_000),
+            tokens_after: 4_000,
+            elapsed_ms: Some(1_500),
+            summary_preview: None,
+        };
+        assert!(apply_child_view_session_event(&mut agent, &completed, false));
+        assert!(
+            agent.session.state.is_idle(),
+            "family-switch compact must return to idle when it finishes"
+        );
+        assert!(agent.turn_started_at.is_none());
+        match last_session_event(&agent.scrollback) {
+            Some(SessionEvent::CompactionCompleted {
+                tokens_before,
+                tokens_after,
+                elapsed_ms,
+            }) => {
+                assert_eq!(tokens_before, Some(12_000));
+                assert_eq!(tokens_after, 4_000);
+                assert_eq!(elapsed_ms, Some(1_500));
+            }
+            other => panic!("idle family-switch compact must flush the outcome immediately, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn family_switch_compact_failed_returns_to_idle() {
+        use crate::app::agent::AgentCommand;
+        use xai_grok_shell::extensions::notification::MODEL_FAMILY_SWITCH_COMPACT_BANNER;
+
+        let mut agent = make_agent(Some("s1"));
+        let started = XaiSessionUpdate::AutoCompactStarted {
+            tokens_used: 12_000,
+            context_window: 200_000,
+            percentage: 6,
+            reason: MODEL_FAMILY_SWITCH_COMPACT_BANNER.into(),
+        };
+        assert!(apply_child_view_session_event(&mut agent, &started, false));
+        assert!(matches!(
+            agent.session.state,
+            crate::app::agent::AgentState::CommandRunning {
+                command: AgentCommand::SwitchModelCompact,
+                ..
+            }
+        ));
+
+        let failed = XaiSessionUpdate::AutoCompactFailed {
+            error: "compaction failed".into(),
+        };
+        assert!(apply_child_view_session_event(&mut agent, &failed, false));
+        assert!(
+            agent.session.state.is_idle(),
+            "family-switch compact must return to idle on failure"
+        );
+        assert!(agent.turn_started_at.is_none());
+    }
+
+    #[test]
+    fn family_switch_compact_replay_does_not_start_command() {
+        use xai_grok_shell::extensions::notification::MODEL_FAMILY_SWITCH_COMPACT_BANNER;
+
+        let mut agent = make_agent(Some("s1"));
+        agent.session.loading_replay = true;
+        let update = XaiSessionUpdate::AutoCompactStarted {
+            tokens_used: 12_000,
+            context_window: 200_000,
+            percentage: 6,
+            reason: MODEL_FAMILY_SWITCH_COMPACT_BANNER.into(),
+        };
+        assert!(apply_child_view_session_event(&mut agent, &update, false));
+        match last_session_event(&agent.scrollback) {
+            Some(SessionEvent::CompactionStarted { reason, .. }) => {
+                assert_eq!(reason, MODEL_FAMILY_SWITCH_COMPACT_BANNER);
+            }
+            other => panic!("replay must still paint the banner, got {other:?}"),
+        }
+        assert!(
+            agent.session.state.is_idle(),
+            "replayed family-switch compact must not own CommandRunning, got {:?}",
+            agent.session.state
+        );
+        assert!(agent.turn_started_at.is_none());
+
+        let completed = XaiSessionUpdate::AutoCompactCompleted {
+            tokens_before: Some(12_000),
+            tokens_after: 4_000,
+            elapsed_ms: Some(1_500),
+            summary_preview: None,
+        };
+        assert!(apply_child_view_session_event(&mut agent, &completed, false));
+        assert!(
+            agent.session.state.is_idle(),
+            "replay completed must leave the pane idle"
+        );
+        match last_session_event(&agent.scrollback) {
+            Some(SessionEvent::CompactionCompleted { tokens_after, .. }) => {
+                assert_eq!(tokens_after, 4_000);
+            }
+            other => panic!("replay must flush the compact outcome immediately, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn threshold_compact_while_idle_does_not_start_switch_model_command() {
+        let mut agent = make_agent(Some("s1"));
+        let update = XaiSessionUpdate::AutoCompactStarted {
+            tokens_used: 90_000,
+            context_window: 131_072,
+            percentage: 85,
+            reason: "threshold".into(),
+        };
+        assert!(apply_child_view_session_event(&mut agent, &update, false));
+        assert!(
+            agent.session.state.is_idle(),
+            "threshold compact must not steal the /model compact command, got {:?}",
+            agent.session.state
+        );
+        assert!(agent.turn_started_at.is_none());
     }
 
     /// Compact failure keeps the hold; the reauth gate in the PromptResponse handler decides whether to stash it.
@@ -859,6 +1035,81 @@
 
     // ── handle_child_session_notification ──────────────────────────────
 
+    /// A hook's note for a child (a PreCompact hook's message, for one) lands in the child's view
+    #[test]
+    fn child_hook_note_shows_in_child_view() {
+        use crate::scrollback::block::RenderBlock;
+        use crate::scrollback::blocks::SessionEvent;
+        use xai_grok_shell::extensions::notification::HookAnnotationKind;
+
+        for (kind, expected) in [
+            (HookAnnotationKind::Note, "note"),
+            (HookAnnotationKind::ToolOutcome, "outcome"),
+        ] {
+            let mut agent = make_agent(Some("root-sess"));
+            let child_sid = "child-sess-1";
+            agent
+                .insert_test_child(child_sid.into(), Box::new(make_agent(Some(child_sid))));
+            let root_len = agent.scrollback.len();
+
+            let update = XaiSessionUpdate::HookAnnotation {
+                message: "Saved 3 working notes to memory".into(),
+                kind,
+            };
+            assert!(handle_child_session_notification(update, child_sid, &mut agent, false, None));
+
+            assert_eq!(agent.scrollback.len(), root_len, "the root transcript is untouched");
+            let child_view = agent.subagent_views.get_mut(child_sid).unwrap();
+            let entry = child_view.scrollback.entries_mut().last().expect("note pushed");
+            match (&entry.block, expected) {
+                (RenderBlock::SessionEvent(b), "note") => {
+                    assert!(matches!(&b.event, SessionEvent::HookAnnotation { message } if message == "Saved 3 working notes to memory"));
+                }
+                (RenderBlock::SessionEvent(b), _) => {
+                    assert!(matches!(&b.event, SessionEvent::HookOutcome { message } if message == "Saved 3 working notes to memory"));
+                }
+                (other, _) => panic!("expected a session event block, got {other:?}"),
+            }
+        }
+    }
+
+    /// The from-disk child replay renders through `apply_child_view_session_event`, so a rebuilt
+    /// child transcript keeps the note the live one showed
+    #[test]
+    fn child_hook_note_kept_on_replay() {
+        use crate::scrollback::block::RenderBlock;
+        use crate::scrollback::blocks::SessionEvent;
+        use xai_grok_shell::extensions::notification::HookAnnotationKind;
+
+        let mut child_view = make_agent(Some("child-sess-1"));
+        child_view.session.loading_replay = true;
+        let update = XaiSessionUpdate::HookAnnotation {
+            message: "Saved 3 working notes to memory".into(),
+            kind: HookAnnotationKind::Note,
+        };
+
+        assert!(apply_child_view_session_event(&mut child_view, &update, false));
+
+        let entry = child_view.scrollback.entries_mut().last().expect("note pushed");
+        match &entry.block {
+            RenderBlock::SessionEvent(b) => {
+                assert!(matches!(&b.event, SessionEvent::HookAnnotation { message } if message == "Saved 3 working notes to memory"));
+            }
+            other => panic!("expected a session event block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn child_hook_note_without_child_view_is_ignored() {
+        let mut agent = make_agent(Some("root-sess"));
+        let update = XaiSessionUpdate::HookAnnotation {
+            message: "Saved 3 working notes to memory".into(),
+            kind: xai_grok_shell::extensions::notification::HookAnnotationKind::Note,
+        };
+        assert!(!handle_child_session_notification(update, "child-gone", &mut agent, false, None));
+        assert_eq!(agent.scrollback.len(), 0);
+    }
+
     #[test]
     fn child_compact_completed_updates_subagent_info() {
         let mut agent = make_agent(Some("root-sess"));
@@ -876,7 +1127,7 @@
             elapsed_ms: Some(300),
             summary_preview: None,
         };
-        let changed = handle_child_session_notification(update, child_sid, &mut agent, false);
+        let changed = handle_child_session_notification(update, child_sid, &mut agent, false, None);
         assert!(changed);
 
         let info = agent.subagent_sessions.get(child_sid).unwrap();
@@ -913,7 +1164,7 @@
             percentage: 72,
             reason: "threshold".into(),
         };
-        let _ = handle_child_session_notification(update, child_sid, &mut agent, false);
+        let _ = handle_child_session_notification(update, child_sid, &mut agent, false, None);
 
         let child_view = agent.subagent_views.get(child_sid).unwrap();
         assert_eq!(
@@ -932,7 +1183,7 @@
             percentage: 85,
             reason: "threshold".into(),
         };
-        let changed = handle_child_session_notification(update, "unknown-child", &mut agent, false);
+        let changed = handle_child_session_notification(update, "unknown-child", &mut agent, false, None);
         assert!(!changed);
     }
 
@@ -951,7 +1202,7 @@
             elapsed_ms: Some(300),
             summary_preview: None,
         };
-        let changed = handle_child_session_notification(update, child_sid, &mut agent, false);
+        let changed = handle_child_session_notification(update, child_sid, &mut agent, false, None);
         // No child_view means nothing visible changed, so it must not trigger a redraw
         assert!(!changed);
         // SubagentInfo is still updated for data correctness even though nothing redraws
@@ -964,7 +1215,7 @@
     fn child_unknown_event_returns_false() {
         let mut agent = make_agent(Some("root-sess"));
         let update = XaiSessionUpdate::MemoryFlushStarted;
-        let changed = handle_child_session_notification(update, "child-1", &mut agent, false);
+        let changed = handle_child_session_notification(update, "child-1", &mut agent, false, None);
         assert!(!changed);
     }
 

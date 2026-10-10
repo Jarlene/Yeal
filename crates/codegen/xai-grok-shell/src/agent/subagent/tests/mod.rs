@@ -14,11 +14,13 @@ use super::attempt_runner::{
     run_one_turn_attempt, usage_is_incomplete,
 };
 use super::handle_request::{
-    CHILD_ACTOR_ACK_TIMEOUT, PARENT_ACK_TIMEOUT, agent_memory_scope_for_mode,
-    child_actor_query, mark_child_usage_not_applied_with_fallback,
+    CHILD_ACTOR_ACK_TIMEOUT, PARENT_ACK_TIMEOUT, TaskModelAdmissionError,
+    admit_explicit_tool_model, agent_memory_scope_for_mode, child_actor_query,
+    explicit_tool_model, mark_child_usage_not_applied_with_fallback,
     reparent_surviving_child_tasks, resolve_child_model, take_child_streaming_partial,
     take_child_turn_messages,
 };
+use crate::agent::remote_config::task_model_policy::TaskModelSelection;
 use crate::test_support::lsp_runtime::{ctx_with_toggle, test_gateway_with_receiver};
 use xai_grok_subagent_resolution::resolve_effective_overrides;
 use xai_grok_tools::implementations::grok_build::task::coordinator::{
@@ -219,6 +221,7 @@ fn wedged_child_handle() -> (
     );
     let (signals_handle, signals_actor) = crate::session::signals::SessionSignalsActor::new();
     let handle = SessionHandle {
+        context_window_selection: Default::default(),
         cmd_tx,
         persistence_tx,
         registry_write_order: Default::default(),
@@ -243,8 +246,8 @@ fn wedged_child_handle() -> (
             std::sync::atomic::AtomicBool::new(true),
         ),
         client_caps: crate::session::notifications::SessionClientCaps::new(false, true),
-        mcp_servers: vec![],
-        initial_client_mcp_servers: vec![],
+        mcp_servers: Default::default(),
+        initial_client_mcp_servers: Default::default(),
         display_cwd: None,
         feedback_manager: std::sync::Arc::new(
             crate::session::feedback_manager::FeedbackManager::local_only("test"),
@@ -745,6 +748,7 @@ fn auto_wake_test_request(id: &str) -> SubagentRequest {
         owner: SubagentOwner::Task,
         cancel_token: CancellationToken::new(),
         spawn_root: Default::default(),
+        tool_call_id: None,
     }
 }
 fn prompt_text(blocks: &[acp::ContentBlock]) -> String {
@@ -1648,6 +1652,7 @@ fn bootstrap_test_request(fork_context: bool) -> SubagentRequest {
         owner: SubagentOwner::Task,
         cancel_token: CancellationToken::new(),
         spawn_root: Default::default(),
+        tool_call_id: None,
     }
 }
 #[tokio::test]
@@ -2035,6 +2040,51 @@ fn validate_subagent_type_unknown_omits_disabled_types_from_available_list() {
             assert!(
                     available.iter().any(|n| n == "general-purpose"),
                     "non-disabled built-ins must still appear: {available:?}",
+                );
+        }
+        other => panic!("expected Unknown, got {other:?}"),
+    }
+}
+#[test]
+fn validate_subagent_type_accepts_plugin_types_and_lists_them_when_unknown() {
+    use xai_grok_agent::plugins::SharedPluginRegistryHandle;
+    use xai_grok_agent::plugins::discovery::DiscoveryConfig;
+    let workdir = tempfile::tempdir().expect("workdir");
+    let plugin_dir = workdir.path().join("demo-plugin");
+    std::fs::create_dir_all(plugin_dir.join("agents")).expect("plugin agents dir");
+    std::fs::write(plugin_dir.join("plugin.json"), r#"{"name":"demo-plugin"}"#)
+        .expect("plugin manifest");
+    std::fs::write(
+            plugin_dir.join("agents").join("reviewer.md"),
+            "---\nname: reviewer\ndescription: Reviews diffs.\n---\n\nReview the diff.\n",
+        )
+        .expect("plugin agent");
+    let registry = SharedPluginRegistryHandle::new(None, Vec::new())
+        .build_for_cwd(
+            workdir.path(),
+            &DiscoveryConfig {
+                cli_plugin_dirs: Vec::new(),
+                config_paths: Vec::new(),
+                disabled: Vec::new(),
+                enabled: Vec::new(),
+            },
+            &[plugin_dir],
+            false,
+        );
+    let ctx = SubagentValidationContext {
+        parent_cwd: workdir.path().to_path_buf(),
+        plugin_registry: registry,
+        ..Default::default()
+    };
+    assert!(matches!(
+            validate_subagent_type("demo-plugin:reviewer", &ctx),
+            SubagentValidateTypeOutcome::Ok,
+        ));
+    match validate_subagent_type("demo-plugin:invented", &ctx) {
+        SubagentValidateTypeOutcome::Unknown { available } => {
+            assert!(
+                    available.iter().any(|n| n == "demo-plugin:reviewer"),
+                    "plugin type missing from available list: {available:?}",
                 );
         }
         other => panic!("expected Unknown, got {other:?}"),
@@ -2538,31 +2588,36 @@ fn subagent_auth_type_rule() {
         );
     assert_eq!(super::subagent_auth_type(None, &api_key), AuthType::ApiKey);
 }
+const SELECTABLE_TOOL: ModelOverrideProvenance = ModelOverrideProvenance::Tool {
+    selection: TaskModelSelection::Selectable,
+};
 #[test]
 fn fresh_tool_model_accepts_visible_key_and_internal_id() {
     let mut models = indexmap::IndexMap::new();
     models.insert("grok-3".to_string(), test_model_entry("grok-3-2025-02-15"));
     assert!(
-            super::handle_request::task_model_override_error(
-                Some("grok-3"),
-                ModelOverrideProvenance::Tool,
-                false,
+            admit_explicit_tool_model(
+                "grok-3",
+                TaskModelSelection::Selectable,
                 &models,
                 false,
             )
-            .is_none(),
+            .is_ok(),
             "key lookup should succeed"
         );
     assert!(
-            super::handle_request::task_model_override_error(
-                Some("grok-3-2025-02-15"),
-                ModelOverrideProvenance::Tool,
-                false,
+            admit_explicit_tool_model(
+                "grok-3-2025-02-15",
+                TaskModelSelection::Selectable,
                 &models,
                 false,
             )
-            .is_none(),
+            .is_ok(),
             "info().model lookup should succeed"
+        );
+    assert_eq!(
+            admit_explicit_tool_model("grok-3", TaskModelSelection::Inherited, &models, false),
+            Err(TaskModelAdmissionError::HiddenSelection),
         );
 }
 #[test]
@@ -2573,18 +2628,17 @@ fn fresh_tool_model_rejects_unavailable_exact_key_over_visible_slug_collision() 
     unavailable_exact.info.hidden = true;
     models.insert("collision".to_string(), unavailable_exact);
     assert_eq!(
-            super::handle_request::task_model_override_error(
-                Some("collision"),
-                ModelOverrideProvenance::Tool,
-                false,
+            admit_explicit_tool_model(
+                "collision",
+                TaskModelSelection::Selectable,
                 &models,
                 false,
-            )
-            .as_deref(),
-            Some(
+            ),
+            Err(TaskModelAdmissionError::Unavailable(
                 "Unknown Task.model slug 'collision'. Valid model slugs: visible-alias. \
                  Omit `model` to inherit the parent model."
-            ),
+                    .to_string()
+            )),
             "validation must inspect the unavailable exact-key entry selected by execution"
         );
 }
@@ -2596,18 +2650,17 @@ fn fresh_tool_model_rejects_unavailable_first_slug_collision() {
     models.insert("blocked-first".to_string(), unavailable_first);
     models.insert("visible-second".to_string(), test_model_entry("shared-routing-slug"));
     assert_eq!(
-            super::handle_request::task_model_override_error(
-                Some("shared-routing-slug"),
-                ModelOverrideProvenance::Tool,
-                false,
+            admit_explicit_tool_model(
+                "shared-routing-slug",
+                TaskModelSelection::Selectable,
                 &models,
                 false,
-            )
-            .as_deref(),
-            Some(
+            ),
+            Err(TaskModelAdmissionError::Unavailable(
                 "Unknown Task.model slug 'shared-routing-slug'. Valid model slugs: \
                  visible-second. Omit `model` to inherit the parent model."
-            ),
+                    .to_string()
+            )),
             "validation must inspect the first routing-slug entry selected by execution"
         );
 }
@@ -2634,62 +2687,53 @@ fn fresh_tool_model_rejects_unknown_and_nonavailable_entries() {
         "oauth-only",
         "oauth-only-internal",
     ] {
-        let error = super::handle_request::task_model_override_error(
-                Some(requested),
-                ModelOverrideProvenance::Tool,
-                false,
+        let error = admit_explicit_tool_model(
+                requested,
+                TaskModelSelection::Selectable,
                 &models,
                 false,
             )
-            .unwrap();
+            .unwrap_err();
         assert_eq!(
                 error,
-                format!(
+                TaskModelAdmissionError::Unavailable(format!(
                     "Unknown Task.model slug '{requested}'. Valid model slugs: alpha, zeta. \
                      Omit `model` to inherit the parent model."
-                )
+                ))
             );
-        assert!(!error.contains("grok models"));
     }
     assert!(
-            super::handle_request::task_model_override_error(
-                Some("oauth-only"),
-                ModelOverrideProvenance::Tool,
-                false,
+            admit_explicit_tool_model(
+                "oauth-only",
+                TaskModelSelection::Selectable,
                 &models,
                 true,
             )
-            .is_none(),
+            .is_ok(),
             "OAuth-only model should resolve for session auth"
         );
 }
 #[test]
 fn resumed_tool_model_override_is_ignored() {
-    let empty = indexmap::IndexMap::new();
+    let overrides = SubagentRuntimeOverrides {
+        model: Some("stale-model".to_string()),
+        model_override_provenance: SELECTABLE_TOOL,
+        ..Default::default()
+    };
     assert!(
-            super::handle_request::task_model_override_error(
-                Some("stale-model"),
-                ModelOverrideProvenance::Tool,
-                true,
-                &empty,
-                false,
-            )
-            .is_none(),
+            explicit_tool_model(&overrides, true).is_none(),
             "resume must preserve source-model pinning"
         );
 }
 #[test]
 fn harness_model_override_keeps_internal_fallback_behavior() {
-    let empty = indexmap::IndexMap::new();
+    let overrides = SubagentRuntimeOverrides {
+        model: Some("internal-model".to_string()),
+        model_override_provenance: ModelOverrideProvenance::Harness,
+        ..Default::default()
+    };
     assert!(
-            super::handle_request::task_model_override_error(
-                Some("internal-model"),
-                ModelOverrideProvenance::Harness,
-                false,
-                &empty,
-                false,
-            )
-            .is_none(),
+            explicit_tool_model(&overrides, false).is_none(),
             "internal role/config pins must retain downstream soft fallback"
         );
 }

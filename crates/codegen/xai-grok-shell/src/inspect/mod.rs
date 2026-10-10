@@ -209,6 +209,8 @@ pub(crate) enum EnforcedSetting {
     ProjectMcpServers,
     /// `plugin_auto_update = false` pin: session-start plugin auto-update off.
     PluginAutoUpdate,
+    /// `allow_managed_hooks_only = true` pin: hooks that are not managed policy do not run.
+    NonManagedHooks,
 }
 
 #[derive(Debug, Serialize)]
@@ -403,12 +405,16 @@ async fn build_report(cwd: &Path) -> InspectReport {
     let project_trusted = crate::agent::folder_trust::project_scope_allowed(cwd);
 
     let trust_store = xai_grok_agent::plugins::TrustStore::load();
-    let mut plugins_cfg: crate::agent::config::PluginsConfig = effective_config
-        .get("plugins")
-        .and_then(|v| v.clone().try_into().ok())
-        .unwrap_or_default();
-    plugins_cfg.merge_claude_enabled_plugins(Some(cwd));
-    let mut plugin_config = plugins_cfg.to_discovery_config();
+    let mut plugin_config = xai_grok_workspace::plugins::resolve_effective_plugins_config(
+        xai_grok_workspace::plugins::PluginConfigInputs {
+            effective_config: effective_config_result.as_ref().ok(),
+            home: xai_dirs::home_dir().as_deref(),
+            grok_home: xai_grok_config::user_grok_home().as_deref(),
+            cwd,
+            trust: xai_grok_hooks::trust::Trust::from_verdict(project_trusted),
+            claude_import: crate::claude_import::import_marker(),
+        },
+    );
     // Project plugins gate on the same folder-trust verdict as hooks and the live session/doctor sites
     // The listing's `enabled` flags therefore match runtime gating
     let discovered_plugins = xai_grok_agent::plugins::discover_plugins(
@@ -425,7 +431,7 @@ async fn build_report(cwd: &Path) -> InspectReport {
         &plugin_config.enabled,
     );
 
-    let external_compat = resolve_inspect_compat(effective_config_result.as_ref().map_err(|_| ()));
+    let external_compat = resolve_inspect_compat(effective_config_result.as_ref().ok());
 
     // This is the same `[skills]` table the runtime loads: `paths` skills appear, `ignore`d ones are hidden, `disabled` ones show as disabled
     let skills_config = crate::config::parse_skills_config(&effective_config);
@@ -776,6 +782,7 @@ fn permission_policy_report(
     for (pin, setting) in [
         (&ms.project_mcp, EnforcedSetting::ProjectMcpServers),
         (&ms.plugin_auto_update, EnforcedSetting::PluginAutoUpdate),
+        (&ms.non_managed_hooks, EnforcedSetting::NonManagedHooks),
     ] {
         if let Some(source) = pin.source() {
             enforced.push(EnforcedPolicy {
@@ -814,9 +821,12 @@ fn list_hooks(
     // Route through the same assembly as session startup
     // Config-layer hooks (config.toml / managed_config.toml / requirements.toml) then appear in `/hooks` status alongside file hooks
     // Each carries its provenance name prefix
-    let config_layers = xai_grok_config::hook_config_layers();
-    let (registry, _errors) =
-        crate::util::hooks::assemble_hooks(&config_layers, git_root, &all_on, project_trusted);
+    let (registry, _errors) = crate::util::hooks::discover_hooks(
+        &crate::util::hooks::process_hook_inputs(),
+        git_root,
+        &all_on,
+        xai_grok_hooks::trust::Trust::from_verdict(project_trusted),
+    );
 
     let mut entries: Vec<HookEntry> = registry
         .all_hooks()
@@ -1076,7 +1086,7 @@ fn list_mcp_servers(
 
     sourced
         .into_iter()
-        .map(|(server, source)| {
+        .map(|(server, origin)| {
             let (name, transport, target) =
                 match &server {
                     agent_client_protocol::McpServer::Stdio(
@@ -1091,7 +1101,8 @@ fn list_mcp_servers(
                     // TODO(acp-0.10): `McpServer` is #[non_exhaustive].
                     _ => ("unknown".to_string(), "unknown", String::new()),
                 };
-            let subject = crate::session::managed_mcp::mcp_subject(&server, &source, &project);
+            let subject = crate::session::managed_mcp::mcp_subject(&server, &origin, &project);
+            let source = ConfigSource::from(origin);
             // The verdict mirrors the merge's deny/allow and project-MCP pin
             // so the report matches what actually loads.
             let disabled_reason = match ms.mcp_verdict(&server, subject) {
@@ -1413,6 +1424,7 @@ fn enforced_label(p: &EnforcedPolicy) -> String {
         EnforcedSetting::Feedback => "Feedback",
         EnforcedSetting::ProjectMcpServers => "Project MCP servers",
         EnforcedSetting::PluginAutoUpdate => "Plugin auto-update",
+        EnforcedSetting::NonManagedHooks => "Hooks outside managed policy",
     };
     let state = if p.enabled { "enabled" } else { "disabled" };
     format!("{name} {state}")
@@ -1843,7 +1855,7 @@ mod tests {
     fn harness_compatibility_human_output_stays_compact() {
         let effective_config: toml::Value =
             toml::from_str("[compat.cursor]\nrules = false").unwrap();
-        let report = compat::resolve_inspect_compat_with_env(Ok(&effective_config), |_| None);
+        let report = compat::resolve_inspect_compat_with_env(Some(&effective_config), |_| None);
 
         let human = render_harness_compatibility(&report);
 
@@ -2206,6 +2218,13 @@ mod tests {
             "Permissions mode: always-approve disabled"
         );
         assert!(!enforced_label(&p).contains("yolo"));
+
+        let p = EnforcedPolicy {
+            setting: EnforcedSetting::NonManagedHooks,
+            enabled: false,
+            source: "requirements.toml".into(),
+        };
+        assert_eq!(enforced_label(&p), "Hooks outside managed policy disabled");
     }
 
     fn permissions_report(
@@ -2392,6 +2411,10 @@ mod tests {
             source: "/etc/grok/requirements.toml".into(),
             ownership: PolicyLayerOwnership::Admin,
         };
+        ms.non_managed_hooks = PolicyPin::Disabled {
+            source: "/Users/me/.grok/requirements.toml".into(),
+            ownership: PolicyLayerOwnership::User,
+        };
         let PermissionPolicyReport { enforced, .. } = permission_policy_report(&ms, None);
         assert_eq!(
             serde_json::to_value(&enforced).unwrap(),
@@ -2405,6 +2428,11 @@ mod tests {
                     "setting": "pluginAutoUpdate",
                     "enabled": false,
                     "source": "/etc/grok/requirements.toml",
+                },
+                {
+                    "setting": "nonManagedHooks",
+                    "enabled": false,
+                    "source": "/Users/me/.grok/requirements.toml",
                 },
             ])
         );
@@ -2588,18 +2616,18 @@ mod tests {
         );
         login.plugin_name = Some("acme".into());
         let deploy = skill_fixture("deploy", "/tmp/deploy/SKILL.md", SkillScope::Local);
-        // Gated builtins like /flush stay untagged: inspect must not invent /local:flush while the live catalog may still advertise /flush
-        let flush = skill_fixture("flush", "/tmp/flush/SKILL.md", SkillScope::Local);
+        // Gated builtins like /goal stay untagged: inspect must not invent /local:goal while the live catalog may still advertise /goal
+        let goal = skill_fixture("goal", "/tmp/goal/SKILL.md", SkillScope::Local);
         let commit_local = skill_fixture("commit", "/tmp/l/commit/SKILL.md", SkillScope::Local);
         let commit_user = skill_fixture("commit", "/tmp/u/commit/SKILL.md", SkillScope::User);
-        let all = [login, deploy, flush, commit_local, commit_user];
-        let [login, deploy, flush, commit_local, commit_user] = &all;
+        let all = [login, deploy, goal, commit_local, commit_user];
+        let [login, deploy, goal, commit_local, commit_user] = &all;
 
         let entry = collision_entry(login, &all);
         assert_eq!(entry.collides_with.as_deref(), Some("login"));
         assert_eq!(entry.invocable_as.as_deref(), Some("acme:login"));
 
-        for skill in [deploy, flush] {
+        for skill in [deploy, goal] {
             let entry = collision_entry(skill, &all);
             assert_eq!(entry.collides_with, None, "{}", skill.name);
             assert_eq!(entry.invocable_as, None, "{}", skill.name);

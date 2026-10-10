@@ -28,6 +28,15 @@
 
 pub mod archive;
 pub mod backend;
+pub mod batch_dream;
+mod batch_dream_catalog;
+mod batch_dream_commit;
+mod batch_dream_control;
+mod batch_dream_io;
+mod batch_dream_outline;
+mod batch_dream_plan;
+mod batch_dream_recovery;
+mod batch_dream_session;
 pub mod chunker;
 pub mod dream;
 pub mod dream_lock;
@@ -45,9 +54,11 @@ pub mod text_utils;
 pub mod v2;
 mod v2_access;
 pub mod v2_capture;
+pub mod v2_carryover;
 mod v2_clock;
 pub mod v2_consolidation;
 mod v2_maintenance;
+mod v2_topic_reads;
 pub mod watcher;
 
 pub use backend::{EndpointScopedCredentials, MemoryBackendImpl, MemoryBackendParams};
@@ -55,9 +66,10 @@ pub use index::{MemoryIndex, init_sqlite_vec};
 pub use observation::*;
 pub use storage::{MemoryScope, MemoryStorage, SaveRememberNoteError};
 pub use v2::{
-    MAX_MANUAL_OBSERVATION_BYTES, V2Manifest, V2ManifestBudget, V2MemoryScope, V2StorageError,
-    ensure_scope_initialized, ensure_scope_initialized_with_journal_mode,
-    regenerate_scope_manifest, render_scope_manifest,
+    MAX_MANUAL_OBSERVATION_BYTES, V2Manifest, V2ManifestBudget, V2ManifestSource, V2MemoryScope,
+    V2StorageError, collect_scope_manifest_source, ensure_scope_initialized,
+    ensure_scope_initialized_with_journal_mode, persist_scope_manifest, regenerate_scope_manifest,
+    render_manifest_from_source, render_scope_manifest, set_configured_manifest_budget,
 };
 pub use v2_access::{V2AccessError, V2MemoryAccessPolicy, V2PathClass};
 pub use v2_capture::{
@@ -65,6 +77,10 @@ pub use v2_capture::{
     ClaimRequest, CommitResult, MAX_ALIASES, MAX_BODY_BYTES, MAX_KEYWORDS, MAX_OBSERVATIONS,
     MAX_STATEMENT_BYTES, MAX_TERM_BYTES, MAX_TOPIC_BYTES, ObservationDraft, ObservationType,
     V2CaptureError, V2CaptureStore,
+};
+pub use v2_carryover::{
+    V2CarryoverError, V2CarryoverOutcome, V2CarryoverReport, carry_over_legacy_memory,
+    default_legacy_memory_root, legacy_memory_file,
 };
 pub use v2_clock::{SharedV2Clock, SystemV2Clock, V2Clock, system_v2_clock};
 pub use v2_consolidation::{

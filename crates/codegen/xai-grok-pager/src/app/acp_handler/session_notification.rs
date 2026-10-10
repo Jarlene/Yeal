@@ -137,6 +137,9 @@ fn synthesize_replay_turn_marker(
     let visible = agent.replayed_visible_prompts.contains(prompt_id);
     let chatty_rate_limit = is_wake && stop == TurnStopReason::RateLimit && visible;
     if is_wake && (matches!(stop, TurnStopReason::Error) || chatty_rate_limit) {
+        if stop == TurnStopReason::Error {
+            super::prompt_origin::log_failed_wake(prompt_id, agent_result, "replay");
+        }
         agent.failed_wake_marker_for = Some(prompt_id.to_string());
     }
     let suppress = super::prompt_origin::suppress_replay_marker_for_origin(
@@ -227,6 +230,7 @@ pub(super) fn handle_session_notification_with_origin(
             child_sid,
             agent,
             is_api_key_auth,
+            session_notif.meta.as_ref(),
         );
         return changed && is_active;
     }
@@ -285,6 +289,7 @@ pub(super) fn handle_session_notification_with_origin(
     let mut plugins_changed_needs_skills_refetch = false;
     let mut status_snapshot_applied = false;
     let mut terminal_outcome: Option<super::super::turn_completion::TerminalApply> = None;
+    let mut queue_wake_turn_complete = false;
     let mut pending_finish_for_spawn = None;
     let root_session_id: &str = session_notif.session_id.0.as_ref();
     let changed = match session_notif.update {
@@ -298,15 +303,7 @@ pub(super) fn handle_session_notification_with_origin(
         | XaiSessionUpdate::MemoryCaptureActivity { .. }
         | XaiSessionUpdate::MemoryDreamCompleted { .. }
         | XaiSessionUpdate::MemorySessionSaved { .. }) => {
-            let changed = apply_session_event(
-                update,
-                &mut agent.session,
-                &mut agent.scrollback,
-                is_api_key_auth,
-            );
-            if let Some(used) = compaction_context_refresh(update) {
-                refresh_context_used(agent, used);
-            }
+            let changed = apply_compaction_or_retry_update(agent, update, is_api_key_auth);
             if let XaiSessionUpdate::AutoCompactCompleted { .. } = update {
                 agent.todo.update_todos(Vec::new());
             }
@@ -377,31 +374,31 @@ pub(super) fn handle_session_notification_with_origin(
                     let errored = matches!(stop_reason.as_str(), "error" | "rate_limit");
                     if errored && agent.failed_wake_marker_for.as_deref() != Some(&*prompt_id) {
                         agent.failed_wake_marker_for = Some(prompt_id.clone());
-                        if crate::app::dispatch::scrollback_has_recent_error_banner(
+                        if stop_reason == "error" {
+                            super::prompt_origin::log_failed_wake(
+                                &prompt_id,
+                                agent_result.as_deref(),
+                                "busy",
+                            );
+                            false
+                        } else if crate::app::dispatch::scrollback_has_recent_error_banner(
                             &agent.scrollback,
                         ) {
                             false
                         } else {
-                            let event = if stop_reason == "rate_limit" {
+                            agent.push_end_marker_block(
                                 super::prompt_origin::rate_limited_wake_failure_event(
                                     agent_result.as_deref(),
                                     None,
-                                )
-                            } else {
-                                crate::app::turn_completion::failed_turn_event(
-                                    error_kind,
-                                    agent_result.as_deref(),
-                                    None,
-                                )
-                            };
-                            agent.push_end_marker_block(event);
+                                ),
+                            );
                             true
                         }
                     } else {
                         false
                     }
                 } else {
-                    finish_wake_turn(
+                    queue_wake_turn_complete = finish_wake_turn(
                         agent,
                         &prompt_id,
                         super::prompt_origin::WakeTerminal {
@@ -415,7 +412,6 @@ pub(super) fn handle_session_notification_with_origin(
                                 session_notif.meta.as_ref(),
                                 super::super::turn_completion::CANCELLATION_CATEGORY_KEY,
                             ),
-                            error_kind,
                         },
                     );
                     true
@@ -662,13 +658,6 @@ pub(super) fn handle_session_notification_with_origin(
                 child_view.set_sharing_enabled(agent.sharing_enabled);
                 child_view.set_billing_surface_visible(agent.billing_surface_visible);
                 child_view.set_usage_command_visible(agent.usage_command_visible);
-                let dashboard_visible = agent
-                    .prompt
-                    .slash_controller
-                    .registry()
-                    .get("dashboard")
-                    .is_some();
-                child_view.set_dashboard_visible(dashboard_visible);
                 child_view.set_has_session_announcements(
                     agent.prompt.slash_controller.has_session_announcements(),
                 );
@@ -1114,9 +1103,17 @@ pub(super) fn handle_session_notification_with_origin(
             ));
             true
         }
+        XaiSessionUpdate::ServedModel { display_name } => {
+            agent
+                .session
+                .models
+                .set_served_model_name(Some(display_name));
+            true
+        }
         XaiSessionUpdate::ModelChanged {
             model_id,
             reasoning_effort,
+            context_window_selection,
         } => {
             if agent.session.model_switch_pending {
                 tracing::debug!(
@@ -1124,7 +1121,14 @@ pub(super) fn handle_session_notification_with_origin(
                     model_id = %model_id,
                     "ignoring ModelChanged broadcast — local switch is in flight"
                 );
-                return false;
+                let models = &mut agent.session.models;
+                models.model_changed_during_switch = true;
+                let selection_changed = models.context_window_selection != context_window_selection;
+                models.context_window_selection = context_window_selection;
+                if selection_changed {
+                    agent.refresh_context_total();
+                }
+                return selection_changed;
             }
             use xai_grok_shell::sampling::types::ReasoningEffort;
             let new_model_id = acp::ModelId::new(model_id.clone());
@@ -1148,15 +1152,19 @@ pub(super) fn handle_session_notification_with_origin(
                 .and_then(|s| s.parse::<ReasoningEffort>().ok());
             let prev_model = agent.session.models.current.clone();
             let prev_effort = agent.session.models.reasoning_effort;
+            let prev_selection = agent.session.models.context_window_selection;
             agent
                 .session
                 .models
                 .set_current(new_model_id.clone(), effort);
+            agent.session.models.context_window_selection = context_window_selection;
             agent.session.user_model_preference = Some(new_model_id.clone());
             let resolved_effort = agent.session.models.reasoning_effort;
-            let actually_changed =
-                prev_model.as_ref() != Some(&new_model_id) || prev_effort != resolved_effort;
+            let actually_changed = prev_model.as_ref() != Some(&new_model_id)
+                || prev_effort != resolved_effort
+                || prev_selection != context_window_selection;
             if actually_changed {
+                agent.refresh_context_total();
                 tracing::info!(
                     session_id = session_notif.session_id.0.as_ref(),
                     model_id = %model_id,
@@ -1173,12 +1181,17 @@ pub(super) fn handle_session_notification_with_origin(
             capture_enabled,
             dream_enabled,
         } => {
-            let entries = crate::views::memory_modal::build_entries(files);
-            let modal_state = crate::views::memory_modal::MemoryModalState::new(entries)
-                .with_enabled(enabled, disabled_reason)
-                .with_capabilities(capture_enabled, dream_enabled);
+            let listing = xai_grok_shell::extensions::memory::MemoryListing {
+                files,
+                enabled,
+                disabled_reason,
+                capture_enabled,
+                dream_enabled,
+            };
             agent.active_modal = Some(crate::views::modal::ActiveModal::MemoryBrowser {
-                state: Box::new(modal_state),
+                state: Box::new(crate::views::memory_modal::MemoryModalState::from_listing(
+                    listing,
+                )),
             });
             true
         }
@@ -1349,18 +1362,22 @@ pub(super) fn handle_session_notification_with_origin(
         changed |= app.status_line.take_changed();
     }
     if plugins_changed_needs_skills_refetch {
-        if let Some(agent) = app.agents.get(&parent_id)
-            && let Some(session_id) = agent.session.session_id.clone()
-        {
-            app.pending_effects.push(Effect::FetchSkillsList {
-                agent_id: parent_id,
-                session_id,
-            });
-        } else if let Some(agent) = app.agents.get_mut(&parent_id)
+        if let Some(agent) = app.agents.get_mut(&parent_id)
             && let Some(ref mut modal) = agent.extensions_modal
         {
-            modal.skills_data =
-                crate::views::extensions_modal::TabDataState::Error("No active session".into());
+            match agent.session.session_id.clone() {
+                Some(session_id) => app.pending_effects.push(Effect::FetchSkillsList {
+                    agent_id: parent_id,
+                    session_id,
+                    refresh: false,
+                    fetch: modal.next_skills_fetch(),
+                }),
+                None => {
+                    modal.skills_data = crate::views::extensions_modal::TabDataState::Error(
+                        "No active session".into(),
+                    );
+                }
+            }
         } else {
             tracing::warn!("PluginsChanged: agent or modal disappeared before skills re-fetch");
         }
@@ -1386,6 +1403,9 @@ pub(super) fn handle_session_notification_with_origin(
         let deferred = acp::ExtNotification::new("x.ai/session/update", params.into());
         let _ = handle_session_notification_with_origin(&deferred, app, origin);
     }
+    if queue_wake_turn_complete {
+        queue_wake_turn_complete_notification(app, parent_id);
+    }
     if !app.reconnect_pending
         && let Some(agent) = app.agents.get(&parent_id)
         && agent.running_wake_turn.is_none()
@@ -1402,6 +1422,46 @@ pub(super) fn handle_session_notification_with_origin(
     }
     changed && is_active
 }
+fn queue_wake_turn_complete_notification(app: &mut AppView, agent_id: AgentId) {
+    let (session_name, session_id, model) = {
+        let Some(agent) = app.agents.get(&agent_id) else {
+            return;
+        };
+        if !agent.session.pending_prompts.is_empty() {
+            return;
+        }
+        (
+            agent
+                .display_name
+                .as_deref()
+                .or(agent.generated_session_title.as_deref())
+                .map(str::to_string),
+            agent.session.session_id.as_ref().map(|s| s.0.to_string()),
+            agent.session.models.current_model_name(),
+        )
+    };
+    let cwd_str = app.cwd.to_string_lossy().into_owned();
+    let idle_title = crate::notifications::TitleState {
+        session_name: session_name.as_deref(),
+        model: model.as_deref(),
+        activity: None,
+        has_pending_permissions: false,
+        cwd: Some(cwd_str.as_str()),
+        turn_elapsed: None,
+        is_busy: false,
+        focused: true,
+    };
+    app.pending_notification_escapes = app.notification_service.build_idle_escapes(&idle_title);
+    app.deferred_notification = Some((
+        NotificationEvent {
+            kind: NotificationEventKind::TurnComplete,
+            title: session_name.unwrap_or_else(|| "Grok".into()),
+            body: String::from("Turn complete."),
+            session_id,
+        },
+        3,
+    ));
+}
 /// Handle an xAI session notification that targets a child (subagent) session.
 /// Events like compaction, retry, and memory flush are emitted by the child's `acp_session` with the *child's* `session_id`.
 /// This routes them to the correct child view and updates `SubagentInfo` where appropriate.
@@ -1410,6 +1470,7 @@ pub(super) fn handle_child_session_notification(
     child_sid: &str,
     agent: &mut AgentView,
     is_api_key_auth: bool,
+    meta: Option<&serde_json::Value>,
 ) -> bool {
     match update {
         XaiSessionUpdate::AutoCompactStarted { .. }
@@ -1419,7 +1480,8 @@ pub(super) fn handle_child_session_notification(
         | XaiSessionUpdate::RetryState(_)
         | XaiSessionUpdate::MemoryFlushCompleted { .. }
         | XaiSessionUpdate::MemoryDreamCompleted { .. }
-        | XaiSessionUpdate::MemorySessionSaved { .. } => {
+        | XaiSessionUpdate::MemorySessionSaved { .. }
+        | XaiSessionUpdate::HookAnnotation { .. } => {
             let mut changed = false;
             if let Some(child_view) = agent.child_view_for_live_update_mut(child_sid) {
                 changed = apply_child_view_session_event(child_view, &update, is_api_key_auth);
@@ -1464,6 +1526,52 @@ pub(super) fn handle_child_session_notification(
             sync_subagent_activity(agent, child_sid, activity_label);
             true
         }
+        XaiSessionUpdate::TurnCompleted {
+            prompt_id,
+            stop_reason,
+            agent_result,
+            error_kind,
+            elapsed_ms,
+            ..
+        } => {
+            if NotificationMeta::from_json(meta.and_then(|v| v.as_object())).is_replay {
+                return false;
+            }
+            let (finished, label) = {
+                let Some(child_view) = agent.child_view_for_live_update_mut(child_sid) else {
+                    return false;
+                };
+                let finished = super::super::turn_completion::finalize_child_view_turn(
+                    child_view,
+                    super::super::turn_completion::TerminalSignal {
+                        prompt_id: Some(&prompt_id),
+                        stop_reason: Some(&stop_reason),
+                        agent_result: agent_result.as_deref(),
+                        cancel_trigger: terminal_meta_str(
+                            meta,
+                            super::super::turn_completion::CANCEL_TRIGGER_KEY,
+                        ),
+                        cancellation_category: terminal_meta_str(
+                            meta,
+                            super::super::turn_completion::CANCELLATION_CATEGORY_KEY,
+                        ),
+                        cancellation_context: meta.and_then(|m| {
+                            m.get(super::super::turn_completion::CANCELLATION_CONTEXT_KEY)
+                        }),
+                        error_kind: crate::app::error_display::wire_error_kind(
+                            error_kind.as_deref(),
+                        ),
+                    },
+                    elapsed_ms,
+                );
+                let label = finished.then(|| subagent_activity_label(child_view));
+                (finished, label)
+            };
+            if let Some(label) = label {
+                sync_subagent_activity(agent, child_sid, label);
+            }
+            finished
+        }
         _ => false,
     }
 }
@@ -1475,20 +1583,90 @@ pub(crate) fn apply_child_view_session_event(
     update: &XaiSessionUpdate,
     is_api_key_auth: bool,
 ) -> bool {
+    if let XaiSessionUpdate::HookAnnotation { message, kind } = update {
+        return apply_child_hook_annotation(child_view, message, kind);
+    }
+    apply_compaction_or_retry_update(child_view, update, is_api_key_auth)
+}
+/// Renders a hook's message, such as a PreCompact hook's note, in the child's scrollback.
+fn apply_child_hook_annotation(
+    child_view: &mut AgentView,
+    message: &str,
+    kind: &HookAnnotationKind,
+) -> bool {
+    if child_view.scrollback.appearance().disable_plugins {
+        return false;
+    }
+    let event = match kind {
+        HookAnnotationKind::Note => SessionEvent::HookAnnotation {
+            message: message.to_owned(),
+        },
+        HookAnnotationKind::ToolOutcome => SessionEvent::HookOutcome {
+            message: message.to_owned(),
+        },
+    };
+    child_view
+        .scrollback
+        .push_block(RenderBlock::session_event(event));
+    true
+}
+fn apply_compaction_or_retry_update(
+    agent: &mut AgentView,
+    update: &XaiSessionUpdate,
+    is_api_key_auth: bool,
+) -> bool {
+    use crate::app::agent::AgentCommand;
+    use crate::app::cancel_latency::TurnEnd;
+    use std::time::Instant;
+    use xai_grok_shell::extensions::notification::MODEL_FAMILY_SWITCH_COMPACT_BANNER;
     let changed = apply_session_event(
         update,
-        &mut child_view.session,
-        &mut child_view.scrollback,
+        &mut agent.session,
+        &mut agent.scrollback,
         is_api_key_auth,
     );
     if let Some(used) = compaction_context_refresh(update) {
-        refresh_context_used(child_view, used);
+        refresh_context_used(agent, used);
+    }
+    match update {
+        XaiSessionUpdate::AutoCompactStarted { reason, .. } => {
+            if agent.session.state.is_idle()
+                && !agent.session.loading_replay
+                && reason == MODEL_FAMILY_SWITCH_COMPACT_BANNER
+            {
+                agent
+                    .session
+                    .start_command(AgentCommand::SwitchModelCompact);
+                agent.running_wake_turn = None;
+                agent.turn_started_at = Some(Instant::now());
+            }
+        }
+        XaiSessionUpdate::AutoCompactCompleted { .. }
+        | XaiSessionUpdate::AutoCompactFailed { .. }
+        | XaiSessionUpdate::AutoCompactCancelled { .. } => {
+            if agent.session.state.is_switch_model_compact() {
+                agent.session.finish_command();
+                agent.mark_turn_finished(TurnEnd::Completed);
+                agent.activity_started_at = None;
+                agent.last_activity = None;
+            }
+        }
+        _ => {}
     }
     changed
 }
 /// Apply a compaction or retry event to a session's activity state and scrollback.
-/// Test-only shim so dispatch tests can replay notification sequences (e.g. `RetryState::Retrying` then `Exhausted`) through the production handler.
-/// The Retrying arm clears the `in_flight_prompt` rewind stash, which a fixture setting fields directly would miss.
+/// A backend may report a manual `/compact`'s turn through the same notifications as an
+/// auto-compaction; `handle_compact_complete` paints that outcome, so these arms stay quiet
+fn manual_compact_in_flight(session: &AgentSession) -> bool {
+    session
+        .state
+        .command_in_flight()
+        .is_some_and(|command| command.is_compact())
+        && !session.state.is_switch_model_compact()
+}
+/// Lets dispatch tests replay notification sequences (`RetryState::Retrying` then `Exhausted`) through `apply_session_event`.
+/// A fixture that sets fields directly would skip the Retrying arm's clearing of `in_flight_prompt`.
 #[cfg(test)]
 pub(crate) fn apply_session_event_for_test(
     update: &XaiSessionUpdate,
@@ -1552,7 +1730,7 @@ pub(super) fn apply_session_event(
             tracing::info!("Auto-compact completed: {tokens_after} tokens after");
             session.set_compaction_activity(None);
             session.compact_held_prompt = None;
-            if session.loading_replay {
+            if session.loading_replay || session.state.is_switch_model_compact() {
                 scrollback.push_block(RenderBlock::session_event(
                     SessionEvent::CompactionCompleted {
                         tokens_before: *tokens_before,
@@ -1560,7 +1738,7 @@ pub(super) fn apply_session_event(
                         elapsed_ms: *elapsed_ms,
                     },
                 ));
-            } else {
+            } else if !manual_compact_in_flight(session) {
                 session.defer_compaction(*tokens_before, *tokens_after, *elapsed_ms);
             }
             true
@@ -1568,18 +1746,22 @@ pub(super) fn apply_session_event(
         XaiSessionUpdate::AutoCompactFailed { error } => {
             tracing::error!(error = %error, "Auto-compaction failed");
             session.set_compaction_activity(None);
-            scrollback.push_block(RenderBlock::session_event(SessionEvent::CompactionFailed {
-                error: error.clone(),
-            }));
+            if !manual_compact_in_flight(session) {
+                scrollback.push_block(RenderBlock::session_event(SessionEvent::CompactionFailed {
+                    error: error.clone(),
+                }));
+            }
             true
         }
         XaiSessionUpdate::AutoCompactCancelled { .. } => {
             tracing::info!("Auto-compact cancelled");
             session.set_compaction_activity(None);
             session.compact_held_prompt = None;
-            scrollback.push_block(RenderBlock::session_event(
-                SessionEvent::CompactionCancelled,
-            ));
+            if !manual_compact_in_flight(session) {
+                scrollback.push_block(RenderBlock::session_event(
+                    SessionEvent::CompactionCancelled,
+                ));
+            }
             true
         }
         XaiSessionUpdate::RetryState(retry) => {
