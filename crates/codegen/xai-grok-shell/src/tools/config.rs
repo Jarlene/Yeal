@@ -192,43 +192,6 @@ impl GuiToolConfig {
     }
 }
 
-/// User configurable settings for the native GUI tools (`[toolset.gui]`).
-///
-/// Field names and defaults mirror upstream codex PR understudy-ai/codex-cua#3
-/// (`GuiToolsToml` + `resolve_gui_*`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct GuiToolConfig {
-    /// Experimental direct-coordinate targeting for `gui_click` / `gui_drag`
-    /// (advertises the `x` / `y` / `coordinate_space` fields). Default off.
-    pub coordinate_targeting: Option<bool>,
-    /// The `gui_batch` tool (default on).
-    pub batch: Option<bool>,
-    /// Grounding strategy for `gui_batch`: `"parallel"` (default) or `"unified"`.
-    pub batch_grounding_strategy: Option<String>,
-    /// Delay in milliseconds between sequential `gui_batch` step executions.
-    pub batch_action_delay_ms: Option<u64>,
-}
-
-impl GuiToolConfig {
-    /// Resolve into the tool-side settings by layering TOML over upstream
-    /// defaults (`coordinate_targeting` false, batch on, `parallel`, 0ms).
-    pub(crate) fn resolve_settings(
-        &self,
-    ) -> xai_grok_tools::implementations::gui::GuiToolsSettings {
-        let defaults = xai_grok_tools::implementations::gui::GuiToolsSettings::default();
-        xai_grok_tools::implementations::gui::GuiToolsSettings {
-            coordinate_targeting: self.coordinate_targeting.unwrap_or(false),
-            batch_enabled: self.batch.unwrap_or(true),
-            batch_grounding_strategy: self
-                .batch_grounding_strategy
-                .clone()
-                .unwrap_or(defaults.batch_grounding_strategy),
-            batch_action_delay_ms: self.batch_action_delay_ms.unwrap_or(0),
-        }
-    }
-}
-
 /// This is the *shell-side* config that holds sampling-level settings (e.g., web search API key from the sampling client).
 /// It is distinct from `xai_grok_tools::registry::types::ToolsetConfig` which holds tool-implementation-level config (bash limits, web search mode).
 #[derive(Debug, Clone, Serialize, Deserialize)]
