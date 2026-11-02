@@ -1572,12 +1572,19 @@ fn find_smallest_named_node_at_point(
 }
 
 /// Check if a node looks like an identifier.
+///
+/// The whitelist covers the node kinds that the supported grammars emit for
+/// the `@name.*` capture targets of the language queries (Java/C/C++ index
+/// symbol names under `identifier`, `type_identifier`, `field_identifier`
+/// and `namespace_identifier`). Must stay in sync with `is_identifier_like`
+/// in navigation.rs.
 fn is_identifier_like(node: &tree_sitter::Node<'_>) -> bool {
     let kind = node.kind();
     kind == "identifier"
         || kind == "type_identifier"
         || kind == "property_identifier"
         || kind == "field_identifier"
+        || kind == "namespace_identifier" // C++
         || kind == "shorthand_property_identifier"
         || kind == "shorthand_property_identifier_pattern"
         || kind == "attribute" // Python

@@ -620,11 +620,71 @@ pub(crate) fn acp_tool_update(
                 .status(Some(acp::ToolCallStatus::Completed))
                 .raw_output(raw_output_json(output, rewriter)),
         )),
+        // Native GUI tools (upstream PR understudy-ai/codex-cua#3). `success:
+        // false` is a model-facing soft failure (upstream's
+        // `GuiToolOutput.success_for_logging` drove Completed/Failed), so it
+        // maps to Failed here — that status is what the TUI/headless render.
+        // The message is the compact result summary; screenshot data URLs are
+        // scrubbed from `raw_output` so multi-hundred-KB captures never ride
+        // the ACP stream or session replay.
+        ToolOutput::Gui(gui) => {
+            let status = if gui.success {
+                acp::ToolCallStatus::Completed
+            } else {
+                acp::ToolCallStatus::Failed
+            };
+            Some(acp::ToolCallUpdate::new(
+                acp::ToolCallId::new(Arc::from(tool_call_id)),
+                acp::ToolCallUpdateFields::new()
+                    .status(Some(status))
+                    .content(Some(vec![acp::ToolCallContent::from(
+                        acp::ContentBlock::Text(acp::TextContent::new(gui.message.clone())),
+                    )]))
+                    .raw_output(scrub_image_data_urls(raw_output_json(output, rewriter))),
+            ))
+        }
         // Internal tools (open_page, browse_page, etc.) are not used in the shell; they are server-only
         // This arm covers variants that appear when Cargo unifies the optional web-tools feature across the workspace
         #[allow(unreachable_patterns)]
         _ => None,
     }
+}
+
+/// Marker left in place of a scrubbed screenshot payload.
+pub(crate) const IMAGE_DATA_URL_PLACEHOLDER: &str = "<screenshot data url omitted>";
+
+/// Replace `data:image/...;base64,...` strings anywhere in a serialized tool
+/// output with [`IMAGE_DATA_URL_PLACEHOLDER`].
+///
+/// GUI tool outputs embed screenshots (top-level `image_url` and inside
+/// `code_result`); the payloads are far too large for `raw_output`, which is
+/// fanned out to every client, persisted into session replay, and re-sent on
+/// reconnect.
+fn scrub_image_data_urls(value: Option<serde_json::Value>) -> Option<serde_json::Value> {
+    fn scrub(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::String(text) => {
+                if text.starts_with("data:image/") {
+                    *text = IMAGE_DATA_URL_PLACEHOLDER.to_string();
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    scrub(item);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for item in map.values_mut() {
+                    scrub(item);
+                }
+            }
+            _ => {}
+        }
+    }
+    value.map(|mut value| {
+        scrub(&mut value);
+        value
+    })
 }
 
 /// Convert a `Todo` tool output to an ACP `Plan` notification.
@@ -998,6 +1058,65 @@ mod tests {
         // ToolOutput::Text wraps TextOutput { text: String }, which serde can serialize with internal tagging
         // raw_output carries the JSON
         assert!(update.fields.raw_output.is_some());
+    }
+
+    fn gui_output(success: bool, with_screenshot: bool) -> ToolOutput {
+        let screenshot =
+            with_screenshot.then(|| format!("data:image/jpeg;base64,{}", "A".repeat(4096)));
+        ToolOutput::Gui(
+            xai_grok_tools::implementations::gui::handler::GuiToolOutput {
+                message: "Captured macOS display 1 at origin (0, 0) with size 1512x982."
+                    .to_string(),
+                image_url: screenshot.clone(),
+                code_result: serde_json::json!({
+                    "message": "Captured macOS display 1.",
+                    "image_url": screenshot.clone(),
+                    "capture_mode": "display",
+                }),
+                success,
+            },
+        )
+    }
+
+    #[test]
+    fn test_acp_tool_update_gui_success_completes_with_summary() {
+        let update = acp_tool_update(&gui_output(true, true), "call-gui", None, None).unwrap();
+        assert_eq!(update.fields.status, Some(acp::ToolCallStatus::Completed));
+        let content = update.fields.content.as_ref().expect("content");
+        match &content[0] {
+            acp::ToolCallContent::Content(acp::Content {
+                content: acp::ContentBlock::Text(tc),
+                ..
+            }) => assert!(tc.text.starts_with("Captured macOS display 1")),
+            other => panic!("expected Text content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_acp_tool_update_gui_soft_failure_maps_to_failed() {
+        let update = acp_tool_update(&gui_output(false, false), "call-gui", None, None).unwrap();
+        assert_eq!(update.fields.status, Some(acp::ToolCallStatus::Failed));
+    }
+
+    #[test]
+    fn test_acp_tool_update_gui_scrubs_screenshot_data_urls() {
+        let update = acp_tool_update(&gui_output(true, true), "call-gui", None, None).unwrap();
+        let raw = update.fields.raw_output.expect("raw_output");
+        let serialized = raw.to_string();
+        assert!(
+            !serialized.contains("data:image/"),
+            "raw_output must not carry screenshot data URLs: {serialized}"
+        );
+        assert!(serialized.contains(IMAGE_DATA_URL_PLACEHOLDER));
+        // The typed output must still round-trip after scrubbing.
+        let round_tripped: ToolOutput = serde_json::from_value(raw).unwrap();
+        match round_tripped {
+            ToolOutput::Gui(gui) => {
+                assert!(gui.success);
+                assert_eq!(gui.image_url.as_deref(), Some(IMAGE_DATA_URL_PLACEHOLDER));
+            }
+            other => panic!("expected Gui output, got {other:?}"),
+        }
     }
 
     #[test]

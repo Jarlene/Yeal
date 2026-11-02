@@ -31,6 +31,9 @@ use crate::implementations::grok_build::update_goal::UpdateGoalInput;
 use crate::implementations::grok_build::video_gen::{ImageToVideoInput, ReferenceToVideoInput};
 use crate::implementations::grok_build::web_fetch::WebFetchInput;
 use crate::implementations::grok_build::web_search::WebSearchInput;
+use crate::implementations::gui::schemas::{
+    BatchArgs, ClickArgs, DragArgs, KeyArgs, MoveArgs, ObserveArgs, ScrollArgs, TypeArgs, WaitArgs,
+};
 use crate::implementations::lsp::LspToolInput;
 use crate::implementations::memory::types::{MemoryGetInput, MemorySearchInput};
 use crate::implementations::opencode::write::WriteInput;
@@ -95,6 +98,18 @@ pub enum ToolInput {
     SchedulerList(crate::implementations::grok_build::scheduler::list::SchedulerListInput),
     UpdateGoal(UpdateGoalInput),
     Workflow(crate::implementations::grok_build::workflow::WorkflowToolInput),
+    /// Native GUI automation tools (semantic grounding + input event
+    /// dispatch; Swift helper on macOS, in-process X11 backend on Linux).
+    /// One variant per `gui_*` tool.
+    GuiObserve(ObserveArgs),
+    GuiClick(ClickArgs),
+    GuiDrag(DragArgs),
+    GuiScroll(ScrollArgs),
+    GuiType(TypeArgs),
+    GuiKey(KeyArgs),
+    GuiMove(MoveArgs),
+    GuiWait(WaitArgs),
+    GuiBatch(BatchArgs),
     /// Dynamic input for runtime-registered tools (MCP, etc.)
     Dynamic(serde_json::Value),
 }

@@ -597,6 +597,9 @@ pub enum ToolOutput {
     SchedulerList(crate::implementations::grok_build::scheduler::list::SchedulerListOutput),
     UpdateGoal(crate::implementations::grok_build::update_goal::UpdateGoalOutput),
     Workflow(crate::implementations::grok_build::workflow::WorkflowToolOutput),
+    /// Native GUI tools (observe/click/drag/…): `success: false` outputs are
+    /// model-facing soft failures (upstream `GuiToolOutput.success`).
+    Gui(crate::implementations::gui::handler::GuiToolOutput),
     /// Dynamic output for runtime-registered tools (MCP, test tools, etc.)
     Dynamic(DynamicOutput),
     /// Generic text output for tools that produce simple formatted text
@@ -648,6 +651,7 @@ impl ToolOutput {
                 TodoWriteOutput::DuplicateId(_) | TodoWriteOutput::InvalidArgument(_),
             ) => true,
             ToolOutput::GrepSearch(g) => g.exit_code > 1,
+            ToolOutput::Gui(g) => !g.success,
             _ => false,
         }
     }
@@ -943,6 +947,7 @@ impl ToolOutput {
             }
             ToolOutput::UpdateGoal(o) => o.summary.clone(),
             ToolOutput::Workflow(o) => o.message.clone(),
+            ToolOutput::Gui(g) => g.message.clone(),
             ToolOutput::Dynamic(v) => serde_json::to_string_pretty(&v.value).unwrap_or_default(),
             ToolOutput::Text(text) => text.text.clone(),
             ToolOutput::ImageGen(m) => m.prompt_text("Image generated"),

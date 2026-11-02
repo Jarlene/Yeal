@@ -117,3 +117,7 @@ Verifying means more than confirming that the changed screen renders:
 
 If verification reveals a problem, fix it and verify again before ending your turn.
 </browser_verification>${%- endif %}
+${%- if gui_tools_section %}
+
+${{ gui_tools_section }}
+${%- endif %}

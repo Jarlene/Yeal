@@ -104,6 +104,7 @@ impl ToolCategory {
             ToolCallBlock::IntegrationSearch(_) | ToolCallBlock::UseTool(_) => Self::Other,
             ToolCallBlock::MemorySearch(_)
             | ToolCallBlock::SentMessage(_)
+            | ToolCallBlock::Gui(_)
             | ToolCallBlock::Other(_) => Self::Other,
         }
     }
@@ -357,6 +358,7 @@ impl ToolUsageStats {
             ToolCallBlock::MemorySearch(b) => !b.is_success(),
             ToolCallBlock::SentMessage(b) => b.is_failure(),
             ToolCallBlock::Skill(b) => !b.is_success(),
+            ToolCallBlock::Gui(b) => !b.is_success(),
             ToolCallBlock::Other(b) => !b.is_success(),
         }
     }
@@ -375,6 +377,7 @@ impl ToolUsageStats {
             ToolCallBlock::MemorySearch(b) => b.elapsed_ms(),
             ToolCallBlock::SentMessage(b) => b.elapsed_ms(),
             ToolCallBlock::Skill(b) => b.elapsed_ms(),
+            ToolCallBlock::Gui(b) => b.elapsed_ms(),
             ToolCallBlock::Other(b) => b.elapsed_ms(),
         }
     }

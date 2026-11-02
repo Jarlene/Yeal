@@ -1,4 +1,7 @@
+mod c;
+mod cpp;
 mod golang;
+mod java;
 mod javascript;
 mod python;
 mod rust;
@@ -10,7 +13,10 @@ use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 
+pub use c::c_lang;
+pub use cpp::cpp_lang;
 pub use golang::golang;
+pub use java::java_lang;
 pub use javascript::js_lang;
 pub use python::python_lang;
 pub use rust::rust_lang;
@@ -37,6 +43,9 @@ impl LanguageRegistry {
             Arc::new(js_lang()),
             Arc::new(golang()),
             Arc::new(python_lang()),
+            Arc::new(java_lang()),
+            Arc::new(c_lang()),
+            Arc::new(cpp_lang()),
         ];
 
         let mut by_extension = HashMap::new();

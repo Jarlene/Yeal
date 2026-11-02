@@ -76,6 +76,7 @@ fn registered_settings() {
                 ("GROK_ACTIVE_AGENT_MESSAGES", false),
             ),
             ("dock", ("GROK_DOCK", false)),
+            ("gui_tools", ("GROK_GUI_TOOLS", false)),
             ("terminal_theme", ("GROK_TERMINAL_THEME", false)),
             ("file_acceleration", ("GROK_FILE_ACCELERATION", false)),
         ]),
@@ -115,6 +116,10 @@ fn every_registered_feature_reads_its_own_remote_setting() {
             Feature::FileAcceleration => settings.file_acceleration_enabled = Some(value),
             // The one row with no remote tier, stated as such rather than as a projection that reads nothing
             Feature::BackendTools => {
+                assert!(spec.remote.is_none(), "{} grew a remote tier", spec.key);
+                continue;
+            }
+            Feature::GuiTools => {
                 assert!(spec.remote.is_none(), "{} grew a remote tier", spec.key);
                 continue;
             }

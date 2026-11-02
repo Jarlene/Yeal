@@ -815,7 +815,9 @@ impl RenderBlock {
     /// Used to resolve the short relative paths the model prints in prose (`images/1.jpg`) to a clickable link.
     pub(crate) fn media_ref_path(&self) -> Option<std::path::PathBuf> {
         match self {
-            RenderBlock::ToolCall(ToolCallBlock::Other(b)) => b.media_ref_path(),
+            RenderBlock::ToolCall(ToolCallBlock::Other(b) | ToolCallBlock::Gui(b)) => {
+                b.media_ref_path()
+            }
             _ => None,
         }
     }
@@ -865,7 +867,7 @@ impl RenderBlock {
                             ..
                         } => theme.warning,
                     }),
-                    ToolCallBlock::Other(b) => {
+                    ToolCallBlock::Other(b) | ToolCallBlock::Gui(b) => {
                         if b.is_success() {
                             Some(theme.accent_tool)
                         } else {

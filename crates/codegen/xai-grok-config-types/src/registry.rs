@@ -49,6 +49,9 @@ pub enum Feature {
     ActiveAgentMessages,
     /// Consolidated panel dock above the prompt (Subagents / Tasks / Watchers / Queued).
     Dock,
+    /// Native GUI automation tools (`gui_*`, macOS and Linux/X11; ported from
+    /// upstream codex PR understudy-ai/codex-cua#3).
+    GuiTools,
     /// The terminal-native `terminal` color theme (staged rollout).
     TerminalTheme,
     /// Hand local sessions' file systems to an installed file accelerator.
@@ -315,6 +318,15 @@ pub const FEATURES: &[FeatureSpec] = &[
         env: "GROK_DOCK",
         default_enabled: false,
         remote: Some(|settings| settings.dock_enabled),
+        capability: None,
+    },
+    FeatureSpec {
+        id: Feature::GuiTools,
+        key: "gui_tools",
+        path: "features.gui_tools",
+        env: "GROK_GUI_TOOLS",
+        default_enabled: false,
+        remote: None,
         capability: None,
     },
     FeatureSpec {

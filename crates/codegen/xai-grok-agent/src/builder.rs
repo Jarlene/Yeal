@@ -66,6 +66,16 @@ pub struct AgentBuilder {
     lsp: Option<std::sync::Arc<dyn xai_grok_tools::implementations::lsp::LspBackend>>,
     image_gen_config: xai_grok_tools::implementations::grok_build::image_gen::ImageGenConfig,
     video_gen_config: xai_grok_tools::implementations::grok_build::video_gen::VideoGenConfig,
+    /// Native GUI tools config (upstream codex PR understudy-ai/codex-cua#3).
+    /// `Disabled` (default) keeps the `gui_*` tools unadvertised.
+    gui_tools_config: xai_grok_tools::implementations::gui::GuiToolsConfig,
+    /// Harness-side grounding sampler (upstream: the session model client,
+    /// reachable from `ModelGuiGroundingProvider`). Injected into the
+    /// finalized toolset's resources so GUI tool calls can resolve semantic
+    /// targets; `None` keeps grounding unavailable.
+    gui_grounding_sampler: Option<
+        std::sync::Arc<dyn xai_grok_tools::implementations::gui::grounding::GuiGroundingSampler>,
+    >,
     app_builder_deployer_config:
         xai_grok_tools::implementations::grok_build::app_builder::AppBuilderDeployerConfig,
     write_file_enabled: bool,
@@ -323,6 +333,8 @@ impl AgentBuilder {
             lsp: None,
             image_gen_config: Default::default(),
             video_gen_config: Default::default(),
+            gui_tools_config: Default::default(),
+            gui_grounding_sampler: None,
             app_builder_deployer_config: Default::default(),
             write_file_enabled: true,
             active_agent_messages_enabled: false,
@@ -541,6 +553,42 @@ impl AgentBuilder {
         self.lsp = Some(handle);
         self
     }
+    /// Set the native GUI tools configuration (upstream codex PR
+    /// understudy-ai/codex-cua#3).
+    ///
+    /// When `Enabled`, the `gui_*` tools are advertised (macOS, Linux/X11,
+    /// and Windows) and the settings ride each tool's `ToolConfig.params`
+    /// into the engine.
+    /// When `Disabled` (default), the tools are not advertised.
+    /// Feature-flagged via `[features] gui_tools` and `GROK_GUI_TOOLS` env var.
+    pub fn with_gui_tools_config(
+        mut self,
+        config: xai_grok_tools::implementations::gui::GuiToolsConfig,
+    ) -> Self {
+        self.gui_tools_config = config;
+        self
+    }
+    /// Set the harness-side GUI grounding sampler (upstream: the session
+    /// model client). When `Some`, it is injected into the finalized toolset's
+    /// resources and GUI tool calls read it as a `ToolCallContext` extension
+    /// — the presence of the sampler is also the image-input capability
+    /// signal for the GUI engine.
+    pub fn with_gui_grounding_sampler(
+        mut self,
+        sampler: Option<
+            std::sync::Arc<
+                dyn xai_grok_tools::implementations::gui::grounding::GuiGroundingSampler,
+            >,
+        >,
+    ) -> Self {
+        self.gui_grounding_sampler = sampler;
+        self
+    }
+    /// Set the image generation configuration.
+    ///
+    /// When `Enabled`, an `ImageGenClient` is created and injected into the ToolBridge's resources and the `image_gen` tool is registered.
+    /// The tool calls the xAI Imagine API with session credentials.
+    /// When `Disabled` (default), the tool is not registered.
     pub fn with_image_gen_config(
         mut self,
         config: xai_grok_tools::implementations::grok_build::image_gen::ImageGenConfig,
@@ -820,6 +868,58 @@ impl AgentBuilder {
                 tool_config.tools.push(
                     (&xai_grok_tools::implementations::grok_build::ReferenceToVideoTool).into(),
                 );
+            }
+            // Native GUI tools (upstream codex PR understudy-ai/codex-cua#3):
+            // advertised only when the `gui_tools` config is enabled, and only
+            // on macOS, on Linux (X11; native Wayland sessions report
+            // unsupported at runtime and keep the tools disabled), or on
+            // Windows (an interactive desktop session is required; UIPI keeps
+            // elevated target apps out of reach from non-elevated processes).
+            // `gui_batch` additionally follows the upstream `batch_enabled`
+            // flag. The resolved settings ride every tool's
+            // params so the advertised schema (`coordinate_targeting`) and the
+            // runtime engine read the same values.
+            if cfg!(any(
+                target_os = "macos",
+                target_os = "linux",
+                target_os = "windows"
+            )) {
+                if let xai_grok_tools::implementations::gui::GuiToolsConfig::Enabled(
+                    ref gui_settings,
+                ) = self.gui_tools_config
+                {
+                    use xai_grok_tools::implementations::gui;
+                    tool_config.tools.push((&gui::GuiObserveTool).into());
+                    tool_config.tools.push((&gui::GuiClickTool).into());
+                    tool_config.tools.push((&gui::GuiDragTool).into());
+                    tool_config.tools.push((&gui::GuiScrollTool).into());
+                    tool_config.tools.push((&gui::GuiTypeTool).into());
+                    tool_config.tools.push((&gui::GuiKeyTool).into());
+                    tool_config.tools.push((&gui::GuiMoveTool).into());
+                    tool_config.tools.push((&gui::GuiWaitTool).into());
+                    if gui_settings.batch_enabled {
+                        tool_config.tools.push((&gui::GuiBatchTool).into());
+                    }
+                    let gui_params = serde_json::to_value(gui_settings)
+                        .ok()
+                        .and_then(|value| value.as_object().cloned())
+                        .unwrap_or_default();
+                    merge_tool_params(
+                        &mut tool_config,
+                        &[
+                            "GrokBuild:gui_observe",
+                            "GrokBuild:gui_click",
+                            "GrokBuild:gui_drag",
+                            "GrokBuild:gui_scroll",
+                            "GrokBuild:gui_type",
+                            "GrokBuild:gui_key",
+                            "GrokBuild:gui_move",
+                            "GrokBuild:gui_wait",
+                            "GrokBuild:gui_batch",
+                        ],
+                        &gui_params,
+                    );
+                }
             }
             let has_write_tool = tool_config
                 .tools
@@ -1196,6 +1296,9 @@ impl AgentBuilder {
                 ),
             );
         }
+        if let Some(sampler) = self.gui_grounding_sampler.take() {
+            tool_bridge.toolset().resources.lock().await.insert(sampler);
+        }
         if let Some(names) = self.persisted_announced_skill_names {
             tool_bridge.restore_announced_skill_names(names).await;
         }
@@ -1300,6 +1403,15 @@ impl AgentBuilder {
             audience: self.prompt_audience,
             prompt_body: definition.prompt_body.clone(),
             include_browser_verification: definition.include_browser_verification(),
+            gui_tools_section: crate::prompt::gui::render_gui_tools_section(
+                cfg!(any(
+                    target_os = "macos",
+                    target_os = "linux",
+                    target_os = "windows"
+                )) && self.gui_tools_config.is_enabled(),
+                self.gui_tools_config.settings().coordinate_targeting,
+                self.gui_tools_config.settings().batch_enabled,
+            ),
             system_prompt: definition.system_prompt.clone(),
             agents_md_files,
             persona_summaries: self.persona_summaries,
@@ -1569,6 +1681,128 @@ mod tests {
     #[tokio::test]
     async fn active_agent_messages_predeclared_is_not_duplicated() {
         assert_eq!(messaging_tool_count(Some(true), true, None).await, 1);
+    }
+    /// GUI tools advertisement (upstream codex PR understudy-ai/codex-cua#3):
+    /// absent by default; the 8 core tools plus `gui_batch` when enabled;
+    /// `gui_batch` follows `batch_enabled`; the prompt section follows the
+    /// same flag.
+    async fn gui_tool_names(
+        settings: Option<xai_grok_tools::implementations::gui::GuiToolsSettings>,
+    ) -> Vec<String> {
+        use xai_grok_tools::computer::local::LocalTerminalBackend;
+        let definition = crate::config::AgentDefinition::default_grok_build();
+        let mut builder = AgentBuilder::new(
+            std::env::temp_dir(),
+            Arc::new(LocalTerminalBackend::new()),
+            ToolNotificationHandle::noop(),
+        )
+        .from_definition(definition);
+        if let Some(settings) = settings {
+            builder = builder.with_gui_tools_config(
+                xai_grok_tools::implementations::gui::GuiToolsConfig::Enabled(settings),
+            );
+        }
+        builder
+            .build()
+            .await
+            .expect("agent should build")
+            .tool_definitions()
+            .await
+            .into_iter()
+            .map(|definition| definition.function.name)
+            .filter(|name| name.starts_with("gui_"))
+            .collect()
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    #[tokio::test]
+    async fn gui_tools_absent_by_default_and_advertised_when_enabled() {
+        assert!(
+            gui_tool_names(None).await.is_empty(),
+            "gui tools must not be advertised while the feature is disabled"
+        );
+        let names = gui_tool_names(Some(Default::default())).await;
+        for name in [
+            "gui_observe",
+            "gui_click",
+            "gui_drag",
+            "gui_scroll",
+            "gui_type",
+            "gui_key",
+            "gui_move",
+            "gui_wait",
+            "gui_batch",
+        ] {
+            assert!(
+                names.iter().any(|n| n == name),
+                "missing {name} in {names:?}"
+            );
+        }
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    #[tokio::test]
+    async fn gui_batch_follows_batch_enabled_flag() {
+        let names = gui_tool_names(Some(
+            xai_grok_tools::implementations::gui::GuiToolsSettings {
+                batch_enabled: false,
+                ..Default::default()
+            },
+        ))
+        .await;
+        assert_eq!(
+            names.iter().filter(|n| **n == "gui_batch").count(),
+            0,
+            "gui_batch must follow batch_enabled: {names:?}"
+        );
+        assert_eq!(names.len(), 8, "the eight core gui tools stay: {names:?}");
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    #[tokio::test]
+    async fn gui_prompt_section_follows_the_feature_flag() {
+        use xai_grok_tools::computer::local::LocalTerminalBackend;
+        let definition = crate::config::AgentDefinition::default_grok_build();
+        let prompt = AgentBuilder::new(
+            std::env::temp_dir(),
+            Arc::new(LocalTerminalBackend::new()),
+            ToolNotificationHandle::noop(),
+        )
+        .from_definition(definition)
+        .with_gui_tools_config(
+            xai_grok_tools::implementations::gui::GuiToolsConfig::Enabled(Default::default()),
+        )
+        .build()
+        .await
+        .expect("agent should build")
+        .system_prompt()
+        .to_string();
+        assert!(prompt.contains("## Native GUI Tools"));
+        assert!(prompt.contains("observe-act-verify"));
+        assert!(prompt.contains("`gui_batch`"));
+    }
+    /// Linux-only twin of the advertisement tests above: on Linux the nine
+    /// `gui_*` tools must advertise exactly like on macOS. Compiled (and
+    /// skipped) away on macOS hosts.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn gui_tools_advertised_on_linux() {
+        let names = gui_tool_names(Some(Default::default())).await;
+        assert_eq!(
+            names.len(),
+            9,
+            "all nine gui tools advertise on Linux: {names:?}"
+        );
+    }
+    /// Windows twin of the advertisement tests above: on Windows the nine
+    /// `gui_*` tools must advertise exactly like on macOS and Linux.
+    /// Compiled (and skipped) away on macOS and Linux hosts.
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn gui_tools_advertised_on_windows() {
+        let names = gui_tool_names(Some(Default::default())).await;
+        assert_eq!(
+            names.len(),
+            9,
+            "all nine gui tools advertise on Windows: {names:?}"
+        );
     }
     #[tokio::test]
     async fn active_agent_messages_stay_within_the_capability_ceiling() {

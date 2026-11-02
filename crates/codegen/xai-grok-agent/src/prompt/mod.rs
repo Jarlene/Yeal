@@ -1,6 +1,7 @@
 pub mod agents_md;
 pub mod browser_verification;
 pub mod context;
+pub mod gui;
 pub mod ignore;
 pub mod paths;
 pub mod skills;

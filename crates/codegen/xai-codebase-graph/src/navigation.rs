@@ -340,6 +340,12 @@ fn find_smallest_named_node_at_point(
 }
 
 /// Check if a node looks like an identifier.
+///
+/// The whitelist covers the node kinds that the supported grammars emit for
+/// the `@name.*` capture targets of the language queries (Java/C/C++ index
+/// symbol names under `identifier`, `type_identifier`, `field_identifier`
+/// and `namespace_identifier`). Must stay in sync with `is_identifier_like`
+/// in index_manager.rs.
 fn is_identifier_like(node: &tree_sitter::Node<'_>) -> bool {
     let kind = node.kind();
     matches!(
@@ -348,9 +354,10 @@ fn is_identifier_like(node: &tree_sitter::Node<'_>) -> bool {
             | "type_identifier"
             | "property_identifier"
             | "field_identifier"
+            | "namespace_identifier" // C++
             | "shorthand_property_identifier"
             | "shorthand_property_identifier_pattern"
-            | "attribute"           // Python
+            | "attribute"            // Python
             | "package_identifier" // Go
     )
 }
@@ -811,5 +818,82 @@ function FileTreeTab({{ basePath, onFileSelect }}) {{
             base_path_line30,
             "basePath should be referenced on line 30 (useEffect dependency array)"
         );
+    }
+
+    /// Evidence for the `is_identifier_like` whitelists (this file and
+    /// index_manager.rs — the two must stay in sync).
+    ///
+    /// Parses one representative snippet per newly supported language family
+    /// (Java/C/C++) with the language's own grammar and runs the real index
+    /// query, printing the node kind every `@name.*` capture lands on.
+    /// Assertions are deliberately count-only so the test documents which
+    /// identifier-like kinds the whitelists must contain without coupling to
+    /// exact kind spellings — run with `--nocapture` to inspect the kinds.
+    #[test]
+    fn evidence_name_capture_node_kinds_java_c_cpp() {
+        use tree_sitter::StreamingIterator;
+
+        let registry = crate::languages::LanguageRegistry::new();
+
+        // (extension, snippet, minimum expected number of @name.* captures)
+        let cases: &[(&str, &str, usize)] = &[
+            (
+                "java",
+                "public class Greeter {\n    public String greet() {\n        return \"Hello\";\n    }\n}\n",
+                2,
+            ),
+            (
+                "c",
+                "#include <math.h>\n\n#define PI 3.14159\n\ndouble distance(double x) {\n    return x * PI;\n}\n",
+                2,
+            ),
+            (
+                "cpp",
+                "namespace geometry {\n\n    class Point {\n    public:\n        double norm() { return 1.0; }\n    };\n\n}\n",
+                3,
+            ),
+        ];
+
+        let mut observed = std::collections::BTreeSet::new();
+        for &(ext, snippet, min_names) in cases {
+            let config = registry
+                .for_extension(ext)
+                .unwrap_or_else(|| panic!("registry must resolve .{}", ext));
+            let query = config.compile_query().expect("query must compile");
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(&config.language())
+                .expect("grammar must load");
+            let tree = parser
+                .parse(snippet.as_bytes(), None)
+                .expect("snippet must parse");
+
+            let capture_names = query.capture_names();
+            let mut cursor = tree_sitter::QueryCursor::new();
+            let mut matches = cursor.matches(&query, tree.root_node(), snippet.as_bytes());
+
+            let mut names = 0usize;
+            while let Some(m) = matches.next() {
+                for capture in m.captures {
+                    let cap = capture_names[capture.index as usize];
+                    if cap.starts_with("name.") {
+                        names += 1;
+                        let node = capture.node;
+                        let kind = node.kind();
+                        let text = &snippet[node.byte_range()];
+                        eprintln!("[{}] {} lands on `{}` (text `{}`)", ext, cap, kind, text);
+                        observed.insert(kind.to_string());
+                    }
+                }
+            }
+            assert!(
+                names >= min_names,
+                "[{}] expected at least {} @name.* captures, got {}",
+                ext,
+                min_names,
+                names
+            );
+        }
+        eprintln!("distinct name node kinds observed: {:?}", observed);
     }
 }

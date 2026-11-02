@@ -13,6 +13,35 @@ pub(super) fn drain_tool_layer_extracted_images(
             std::mem::take(&mut fc.extracted_images)
         }
         ToolsToolOutput::MCP(mcp) => std::mem::take(&mut mcp.extracted_images),
+        // Native GUI captures (upstream observe returned the screenshot as an
+        // InputImage block in the tool output body): drain the screenshot data
+        // URL off the output so it reaches the model as a session-vision image
+        // instead of riding the raw_output payload.
+        ToolsToolOutput::Gui(gui) => {
+            let Some(image_url) = gui.image_url.take() else {
+                return Vec::new();
+            };
+            let Some((mime_type, data)) =
+                xai_grok_tools::implementations::gui::handler::parse_data_url(&image_url)
+            else {
+                gui.image_url = Some(image_url);
+                return Vec::new();
+            };
+            gui.message = format!(
+                "{}\n\n{}",
+                gui.message,
+                xai_grok_tools::util::base64_images::IMAGE_CONTENT_PLACEHOLDER
+            );
+            // Keep the multi-MB payload out of hook-facing serialization once
+            // it has been drained.
+            if let Some(fields) = gui.code_result.as_object_mut() {
+                fields.remove("image_url");
+            }
+            vec![ExtractedImage {
+                data: data.to_owned(),
+                mime_type: mime_type.to_owned(),
+            }]
+        }
         _ => Vec::new(),
     }
 }
@@ -62,6 +91,7 @@ mod tests {
         DrainedToolSuccess, drain_tool_layer_extracted_images, split_tool_layer_for_harness,
     };
     use std::path::PathBuf;
+    use xai_grok_tools::implementations::gui::handler::GuiToolOutput;
     use xai_grok_tools::types::output::{
         FileContent, MCPOutput, ReadFileOutput, SearchToolOutput, ToolOutput, ToolRunResult,
     };
@@ -72,6 +102,19 @@ mod tests {
             data: data.to_owned(),
             mime_type: mime.to_owned(),
         }
+    }
+
+    fn gui_run_output(image_url: Option<String>) -> ToolOutput {
+        let url = image_url.clone();
+        ToolOutput::Gui(GuiToolOutput {
+            message: "Captured the current display for visual inspection.".into(),
+            image_url,
+            code_result: serde_json::json!({
+                "message": "Captured the current display for visual inspection.",
+                "image_url": url,
+            }),
+            success: true,
+        })
     }
 
     fn run_result(output: ToolOutput) -> ToolRunResult {
@@ -197,6 +240,72 @@ mod tests {
             content: "no images".into(),
         });
         assert!(drain_tool_layer_extracted_images(&mut output).is_empty());
+    }
+
+    #[test]
+    fn harvests_gui_screenshot_and_drains() {
+        let payload = "C".repeat(4000);
+        let mut output = gui_run_output(Some(format!("data:image/png;base64,{payload}")));
+
+        let harvested = drain_tool_layer_extracted_images(&mut output);
+        assert_eq!(harvested.len(), 1);
+        assert_eq!(harvested[0].mime_type, "image/png");
+        assert_eq!(harvested[0].data, payload);
+
+        let ToolOutput::Gui(gui) = &output else {
+            panic!("expected Gui");
+        };
+        assert!(
+            gui.image_url.is_none(),
+            "must drain so a second harvest cannot double-attach"
+        );
+        assert!(gui.message.contains(IMAGE_CONTENT_PLACEHOLDER));
+        assert!(
+            gui.code_result.get("image_url").is_none(),
+            "code_result must not keep carrying the payload after drain"
+        );
+
+        // Idempotent: a second harvest returns nothing.
+        assert!(drain_tool_layer_extracted_images(&mut output).is_empty());
+    }
+
+    #[test]
+    fn gui_output_without_image_yields_empty() {
+        let mut output = gui_run_output(None);
+        assert!(drain_tool_layer_extracted_images(&mut output).is_empty());
+        let ToolOutput::Gui(gui) = &output else {
+            panic!("expected Gui");
+        };
+        assert!(gui.message.contains(IMAGE_CONTENT_PLACEHOLDER) == false);
+    }
+
+    #[test]
+    fn gui_output_non_data_url_image_left_in_place() {
+        let mut output = gui_run_output(Some("file:///tmp/shot.png".into()));
+        assert!(drain_tool_layer_extracted_images(&mut output).is_empty());
+        let ToolOutput::Gui(gui) = &output else {
+            panic!("expected Gui");
+        };
+        assert_eq!(gui.image_url.as_deref(), Some("file:///tmp/shot.png"));
+        assert!(gui.message.contains(IMAGE_CONTENT_PLACEHOLDER) == false);
+    }
+
+    #[test]
+    fn drained_tool_success_new_drains_gui_screenshot() {
+        let payload = "D".repeat(3000);
+        let drained = DrainedToolSuccess::new(run_result(gui_run_output(Some(format!(
+            "data:image/png;base64,{payload}"
+        )))));
+
+        let (result, images) = drained.into_parts();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].mime_type, "image/png");
+        assert_eq!(images[0].data, payload);
+        let ToolOutput::Gui(gui) = result.output else {
+            panic!("expected Gui");
+        };
+        assert!(gui.image_url.is_none());
+        assert!(gui.code_result.get("image_url").is_none());
     }
 
     #[test]

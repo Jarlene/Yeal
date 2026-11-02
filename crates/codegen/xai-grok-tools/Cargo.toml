@@ -76,6 +76,7 @@ tokio = { workspace = true, features = [
     "rt-multi-thread",
     "net",
     "sync",
+    "time",
 ] }
 tokio-util = { workspace = true, features = ["compat"] }
 tonic = { workspace = true }
@@ -101,9 +102,19 @@ zstd = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 command-fds = { version = "0.3", features = ["tokio"] }
 nix = { workspace = true, features = ["signal", "process", "fs"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
+# GUI tool physical-resource lock stale-holder detection (kill(pid, 0)).
 libc = { workspace = true }
+
+# Native GUI tools: runtime-compiled Swift helper (SHA-1-keyed temp dir).
+[target.'cfg(target_os = "macos")'.dependencies]
+sha1 = { workspace = true }
+
+# Linux native GUI tools: in-process pure-Rust X11 backend (x11rb
+# RustConnection, XTEST input injection, RANDR monitor geometry, core
+# GetImage screenshots, EWMH window management, RECORD escape monitoring).
+# No libxcb; Wayland is not supported (X11/XWayland only).
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.13", features = ["randr", "xtest", "record", "xkb"] }
 
 # windows: util::spawn uses Win32 Job Objects (CreateJobObjectW,
 # AssignProcessToJobObject, TerminateJobObject) and process creation flags
@@ -111,8 +122,33 @@ libc = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = ["Win32_Storage_FileSystem"] }
 
+# Windows native GUI tools: in-process pure-FFI Win32 backend (GDI
+# BitBlt/GetDIBits virtual-screen screenshots, SendInput input injection,
+# EnumWindows/DwmGetWindowAttribute window management, WH_KEYBOARD_LL
+# emergency-stop monitor) — same no-helper architecture as the Linux X11
+# backend. Features unify with the windows-sys 0.61 lock node already in the
+# graph (console, dirs-sys).
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_HiDpi",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+] }
+# gui_type clipboard-paste strategies: set text + Ctrl+V. arboard's Windows
+# backend (clipboard-win) is already in Cargo.lock; the clipboard is a
+# process-global cooperative buffer, so pasted text overwrites the user's
+# clipboard contents and they are not restored.
+arboard = { workspace = true }
+
 [dev-dependencies]
 pretty_assertions = { workspace = true }
+serial_test = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true, features = ["fmt"] }
 wiremock = { workspace = true }

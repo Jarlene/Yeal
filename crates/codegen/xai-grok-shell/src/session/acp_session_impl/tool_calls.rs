@@ -29,6 +29,18 @@ struct ValidatedRewrite {
     updated_json: serde_json::Value,
     hook_name: String,
 }
+/// Optional `: <target> in `<app>`` suffix shared by the GUI tool titles so
+/// inProgress tool-call blocks name what is being acted on.
+fn gui_call_suffix(app: Option<&str>, target: Option<&str>) -> String {
+    let app = app.filter(|a| !a.trim().is_empty());
+    let target = target.filter(|t| !t.trim().is_empty());
+    match (target, app) {
+        (Some(target), Some(app)) => format!(": {target} in `{app}`"),
+        (Some(target), None) => format!(": {target}"),
+        (None, Some(app)) => format!(" in `{app}`"),
+        (None, None) => String::new(),
+    }
+}
 /// Whether a tool name is an MCP `create_pull_request` (qualified `server__create_pull_request` or bare).
 fn is_mcp_create_pull_request(tool_name: &str) -> bool {
     match crate::session::mcp_servers::parse_mcp_tool_name(tool_name) {
@@ -2683,6 +2695,85 @@ impl SessionActor {
             ),
             ToolInput::SchedulerList(_) => (
                 "List scheduled tasks".to_string(),
+                acp::ToolKind::Other,
+                vec![],
+                vec![],
+            ),
+            // Native GUI tools (upstream PR understudy-ai/codex-cua#3): show
+            // the action + target while in progress. Never include typed
+            // text — it may come from a secret env var.
+            ToolInput::GuiObserve(args) => (
+                format!(
+                    "Observe screen{}",
+                    gui_call_suffix(args.app.as_deref(), args.target.as_deref())
+                ),
+                acp::ToolKind::Other,
+                vec![],
+                vec![],
+            ),
+            ToolInput::GuiClick(args) => (
+                format!(
+                    "Click{}",
+                    gui_call_suffix(args.app.as_deref(), args.target.as_deref())
+                ),
+                acp::ToolKind::Other,
+                vec![],
+                vec![],
+            ),
+            ToolInput::GuiDrag(args) => (
+                format!(
+                    "Drag{}",
+                    gui_call_suffix(
+                        args.app.as_deref(),
+                        args.to_target.as_deref().or(args.from_target.as_deref()),
+                    )
+                ),
+                acp::ToolKind::Other,
+                vec![],
+                vec![],
+            ),
+            ToolInput::GuiScroll(args) => (
+                format!(
+                    "Scroll{}{}",
+                    args.direction
+                        .as_deref()
+                        .map(|d| format!(" {d}"))
+                        .unwrap_or_default(),
+                    gui_call_suffix(args.app.as_deref(), args.target.as_deref()),
+                ),
+                acp::ToolKind::Other,
+                vec![],
+                vec![],
+            ),
+            ToolInput::GuiType(_) => (
+                "Type text".to_string(),
+                acp::ToolKind::Other,
+                vec![],
+                vec![],
+            ),
+            ToolInput::GuiKey(args) => (
+                format!("Press {}", args.key),
+                acp::ToolKind::Other,
+                vec![],
+                vec![],
+            ),
+            ToolInput::GuiMove(args) => (
+                format!("Move pointer to ({}, {})", args.x, args.y),
+                acp::ToolKind::Other,
+                vec![],
+                vec![],
+            ),
+            ToolInput::GuiWait(args) => (
+                format!(
+                    "Wait for{}",
+                    gui_call_suffix(args.app.as_deref(), Some(args.target.as_str()))
+                ),
+                acp::ToolKind::Other,
+                vec![],
+                vec![],
+            ),
+            ToolInput::GuiBatch(args) => (
+                format!("Run batch of {} GUI steps", args.steps.len()),
                 acp::ToolKind::Other,
                 vec![],
                 vec![],

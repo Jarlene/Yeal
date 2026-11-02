@@ -5120,6 +5120,170 @@ fn tier_restricted_media_shows_upsell_text_not_error() {
         block.output
     );
 }
+
+// ---------------------------------------------------------------------------
+// Native GUI tools (upstream PR understudy-ai/codex-cua#3): first-class block
+// with tool name, compact argument summary, and compact result summary.
+// ---------------------------------------------------------------------------
+
+fn gui_result_output(success: bool, message: &str, screenshot: bool) -> ToolOutput {
+    ToolOutput::Gui(xai_grok_tools::implementations::gui::GuiToolOutput {
+        message: message.to_string(),
+        image_url: screenshot.then(|| "data:image/jpeg;base64,QUJD".to_string()),
+        code_result: serde_json::json!({
+            "tool": "gui_click",
+            "image_url": screenshot.then(|| "data:image/jpeg;base64,QUJD".to_string()),
+        }),
+        success,
+    })
+}
+
+/// Refined tool call: variant tag + shell title ("Click: Send button in
+/// `Mail`"). The subject already rides the title, so the summary keeps only
+/// the secondary details.
+#[test]
+fn gui_refined_call_uses_shell_title_and_detail_summary() {
+    let tc = acp::ToolCall::new(
+        acp::ToolCallId::new(Arc::from("gui-click")),
+        "Click: Send button in `Mail`",
+    )
+    .kind(acp::ToolKind::Other)
+    .status(acp::ToolCallStatus::Pending)
+    .content(vec![])
+    .raw_input(Some(serde_json::json!({
+        "variant": "GuiClick",
+        "target": "Send button",
+        "x": 120,
+        "y": 240
+    })))
+    .locations(vec![]);
+    let RenderBlock::ToolCall(ToolCallBlock::Gui(block)) = tool_call_to_block(&tc, None) else {
+        panic!("expected a Gui tool-call block");
+    };
+    assert_eq!(block.name, "Click: Send button in `Mail`");
+    assert_eq!(block.summary, "at (120, 240)");
+    assert!(block.is_success());
+    assert!(block.output.is_none());
+}
+
+/// Early Pending notification: title is still the raw wire name and the raw
+/// model arguments carry no `variant` tag — the block derives its label and
+/// full summary (subject included) from the wire name + arguments.
+#[test]
+fn gui_wire_name_call_derives_label_and_full_summary() {
+    let tc = acp::ToolCall::new(acp::ToolCallId::new(Arc::from("gui-drag")), "gui_drag")
+        .kind(acp::ToolKind::Other)
+        .status(acp::ToolCallStatus::Pending)
+        .content(vec![])
+        .raw_input(Some(serde_json::json!({
+            "from_target": "Icon",
+            "to_x": 10,
+            "to_y": 20,
+            "duration_ms": 450
+        })))
+        .locations(vec![]);
+    let RenderBlock::ToolCall(ToolCallBlock::Gui(block)) = tool_call_to_block(&tc, None) else {
+        panic!("expected a Gui tool-call block");
+    };
+    assert_eq!(block.name, "Drag");
+    assert_eq!(block.summary, "Icon → (10, 20) · 450 ms");
+}
+
+/// Completed with a typed `ToolOutput::Gui`: the engine message is the
+/// compact result summary and the soft-success state holds.
+#[test]
+fn gui_completed_call_shows_result_message() {
+    let output = gui_result_output(true, "Clicked Send button.", true);
+    let tc = acp::ToolCall::new(
+        acp::ToolCallId::new(Arc::from("gui-ok")),
+        "Click: Send button in `Mail`",
+    )
+    .kind(acp::ToolKind::Other)
+    .status(acp::ToolCallStatus::Completed)
+    .content(vec![])
+    .raw_input(Some(
+        serde_json::json!({ "variant": "GuiClick", "target": "Send button" }),
+    ))
+    .raw_output(serde_json::to_value(output).ok())
+    .locations(vec![]);
+    let RenderBlock::ToolCall(ToolCallBlock::Gui(block)) = tool_call_to_block(&tc, None) else {
+        panic!("expected a Gui tool-call block");
+    };
+    assert_eq!(block.output.as_deref(), Some("Clicked Send button."));
+    assert!(block.is_success());
+}
+
+/// `success: false` is a model-facing soft failure — the message renders as
+/// the block error, like any other failed tool.
+#[test]
+fn gui_soft_failure_renders_as_error() {
+    let output = gui_result_output(
+        false,
+        "Could not resolve semantic GUI target `Save`.",
+        false,
+    );
+    let tc = acp::ToolCall::new(acp::ToolCallId::new(Arc::from("gui-soft-fail")), "Click")
+        .kind(acp::ToolKind::Other)
+        .status(acp::ToolCallStatus::Failed)
+        .content(vec![])
+        .raw_input(Some(
+            serde_json::json!({ "variant": "GuiClick", "target": "Save" }),
+        ))
+        .raw_output(serde_json::to_value(output).ok())
+        .locations(vec![]);
+    let RenderBlock::ToolCall(ToolCallBlock::Gui(block)) = tool_call_to_block(&tc, None) else {
+        panic!("expected a Gui tool-call block");
+    };
+    assert_eq!(
+        block.error.as_deref(),
+        Some("Could not resolve semantic GUI target `Save`.")
+    );
+    assert!(!block.is_success());
+}
+
+/// A Failed status without a typed GUI output falls back to the generic
+/// failure line, keeping the failed status visible.
+#[test]
+fn gui_failed_status_without_typed_output_gets_generic_error() {
+    let tc = acp::ToolCall::new(acp::ToolCallId::new(Arc::from("gui-fail")), "gui_wait")
+        .kind(acp::ToolKind::Other)
+        .status(acp::ToolCallStatus::Failed)
+        .content(vec![])
+        .raw_input(Some(
+            serde_json::json!({ "target": "Save dialog", "state": "disappear" }),
+        ))
+        .locations(vec![]);
+    let RenderBlock::ToolCall(ToolCallBlock::Gui(block)) = tool_call_to_block(&tc, None) else {
+        panic!("expected a Gui tool-call block");
+    };
+    assert_eq!(block.name, "Wait for");
+    assert_eq!(block.error.as_deref(), Some("GUI action failed"));
+    assert!(!block.is_success());
+}
+
+/// Non-GUI `raw_output` (e.g. a truncated Text output) falls back to the ACP
+/// content text instead of inventing a GUI result summary.
+#[test]
+fn gui_non_gui_output_falls_back_to_content_text() {
+    let output = ToolOutput::Text(xai_grok_tools::types::output::TextOutput::from("observed"));
+    let tc = acp::ToolCall::new(
+        acp::ToolCallId::new(Arc::from("gui-text")),
+        "Observe screen",
+    )
+    .kind(acp::ToolKind::Other)
+    .status(acp::ToolCallStatus::Completed)
+    .content(vec![acp::ToolCallContent::Content(acp::Content::new(
+        acp::ContentBlock::Text(acp::TextContent::new("observed")),
+    ))])
+    .raw_input(Some(serde_json::json!({ "variant": "GuiObserve" })))
+    .raw_output(serde_json::to_value(output).ok())
+    .locations(vec![]);
+    let RenderBlock::ToolCall(ToolCallBlock::Gui(block)) = tool_call_to_block(&tc, None) else {
+        panic!("expected a Gui tool-call block");
+    };
+    assert_eq!(block.output.as_deref(), Some("observed"));
+    assert!(block.is_success());
+}
 /// The daemon client hand-builds the media card's JSON (it cannot depend on `MediaGenOutput`); this pins that the
 /// exact shape it sends — `type` + `path` only — renders as a media ref for both spellings, and that the fuller
 /// shape the built-in tools send does too.
